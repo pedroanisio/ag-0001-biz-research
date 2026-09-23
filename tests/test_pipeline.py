@@ -216,6 +216,8 @@ def test_research_stops_on_permanent_error_and_resumes(store, http_client):
         pipeline.stage_research(store, llm, groups=GROUPS)
     assert calls["n"] == 2  # stopped at once, no call for the groups after it
     assert store.load_json("research.partial.json")["done"] == ["funding"]
+    with pytest.raises(StageError, match="research is unfinished .*funding.*re-run the research stage"):
+        pipeline.stage_resolve(store, llm)
     res = pipeline.stage_research(store, llm, groups=GROUPS)  # resumes: "news", then one follow-up round
     assert calls["n"] == 4
     assert len(res.findings) == 2  # the same statements found again are not duplicated

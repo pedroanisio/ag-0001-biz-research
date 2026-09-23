@@ -89,6 +89,10 @@ class RunStore:
 
     def load_model(self, name: str, schema: type[T]) -> T:
         if not self.exists(name):
+            if name == "findings.json" and self.exists(RESEARCH_PROGRESS):
+                done = self.load_json(RESEARCH_PROGRESS).get("done", [])
+                raise StageError(f"research is unfinished ({len(done)} calls saved: {', '.join(done) or 'none'}); "
+                                 "re-run the research stage to resume it")
             raise StageError(f"missing {name}; run the earlier stage first")
         return schema.model_validate(json.loads(self.path(name).read_text(encoding="utf-8")))
 

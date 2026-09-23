@@ -20,7 +20,7 @@ def test_structured_returns_validated_model_and_forces_tool():
     out = llm.structured(system="s", user="u", schema=Out)
     assert out == Out(name="a", count=1)
     call = client.messages.calls[0]
-    assert call["tool_choice"] == {"type": "tool", "name": "submit"}
+    assert call["tool_choice"] == {"type": "tool", "name": "submit", "disable_parallel_tool_use": True}
     assert call["tools"][0]["input_schema"]["type"] == "object"
     assert llm.calls == 1
 
@@ -87,11 +87,40 @@ def test_researched_forces_tool_after_text_only_turn_and_pause():
         response(text_block("done searching"), stop_reason="end_turn"),
         response(tool_use("submit_findings", {"name": "a", "count": 1})),
     ])
-    llm = LLM(client, model="m", max_research_turns=4)
+    llm = LLM(client, model="claude-sonnet-4-5", max_research_turns=4)  # basic web search: forcing is allowed
     out, hits = llm.researched(system="s", user="u", schema=Out)
     assert out.name == "a" and [h.url for h in hits] == ["https://a.test/1"]
     assert "tool_choice" not in client.messages.calls[1]
     assert client.messages.calls[2]["tool_choice"] == {"type": "tool", "name": "submit_findings"}
+
+
+def test_researched_never_forces_the_tool_with_dynamic_filtering_search():
+    # web_search_20260209 uses programmatic tool calling; the API rejects forced/single-call tool_choice with it
+    client = scripted([
+        response(text_block("done searching"), stop_reason="end_turn"),
+        response(tool_use("submit_findings", {"name": "", "count": 1}, "tu_1")),
+        response(tool_use("submit_findings", {"name": "a", "count": 1})),
+    ])
+    out, _ = LLM(client, model="claude-sonnet-5").researched(system="s", user="u", schema=Out)
+    assert out.name == "a"
+    assert all("tool_choice" not in c for c in client.messages.calls)
+    assert "Call submit_findings now" in client.messages.calls[1]["messages"][-1]["content"]
+
+
+def test_list_sent_as_json_string_is_decoded_without_another_call():
+    class Many(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        items: list[Out]
+
+    client = scripted([response(tool_use("submit", {"items": '[{"name": "a", "count": 1}]'}))])
+    llm = LLM(client, model="m")
+    assert llm.structured(system="s", user="u", schema=Many).items[0].name == "a" and llm.calls == 1
+    bad = scripted([response(tool_use("submit", {"items": "[not json"}))] * 2)
+    with pytest.raises(LLMOutputError):
+        LLM(bad, model="m", max_attempts=2).structured(system="s", user="u", schema=Many)
+    still_bad = scripted([response(tool_use("submit", {"items": '[{"name": ""}]'}))])
+    with pytest.raises(LLMOutputError):
+        LLM(still_bad, model="m", max_attempts=1).structured(system="s", user="u", schema=Many)
 
 
 def test_researched_ignores_search_error_blocks():
@@ -201,3 +230,42 @@ def test_researched_without_fetch():
     LLM(client, model="m", max_fetch_uses=0).researched(system="s", user="u", schema=Out, max_search_uses=7)
     tools = client.messages.calls[0]["tools"]
     assert [t["name"] for t in tools] == ["web_search", "submit_findings"] and tools[0]["max_uses"] == 7
+
+
+def _answers_every_tool_use(messages: list[dict]) -> bool:
+    """The API rule behind the pbgas 400: each assistant tool_use needs a tool_result right after."""
+    for i, m in enumerate(messages):
+        if m["role"] != "assistant" or not isinstance(m["content"], list):
+            continue
+        ids = {b["id"] for b in m["content"] if b.get("type") == "tool_use"}
+        nxt = messages[i + 1]["content"] if i + 1 < len(messages) else []
+        answered = {b["tool_use_id"] for b in nxt if isinstance(b, dict) and b.get("type") == "tool_result"}
+        if not ids <= answered:
+            return False
+    return True
+
+
+def test_retry_answers_every_tool_call_in_the_rejected_reply():
+    # the model called the output tool twice (and a second declared tool) in one reply; the first call is invalid
+    client = scripted([
+        response(tool_use("submit", {"name": "", "count": 1}, "tu_1"), tool_use("submit", {"name": "b", "count": 2}, "tu_2"),
+                 tool_use("other", {"x": 1}, "tu_3")),
+        response(tool_use("submit", {"name": "ok", "count": 3}, "tu_4")),
+    ])
+    out = LLM(client, model="m", max_attempts=2).structured(
+        system="s", user="u", schema=Out, shared_tools=[("submit", Out, "d"), ("other", Out, "d")])
+    assert out.count == 3
+    retry = client.messages.calls[1]["messages"]
+    assert _answers_every_tool_use(retry)
+    results = {b["tool_use_id"]: b["content"] for b in retry[2]["content"]}
+    assert "Validation failed" in results["tu_1"] and "Ignored" in results["tu_2"] and "Ignored" in results["tu_3"]
+
+
+def test_research_retry_answers_every_tool_call():
+    client = scripted([
+        response(search_result_block(["https://a.test/1"]), tool_use("submit_findings", {"name": "", "count": 1}, "tu_1"),
+                 tool_use("submit_findings", {"name": "x", "count": 1}, "tu_2")),
+        response(tool_use("submit_findings", {"name": "a", "count": 1}, "tu_3")),
+    ])
+    out, _ = LLM(client, model="m").researched(system="s", user="u", schema=Out)
+    assert out.name == "a" and _answers_every_tool_use(client.messages.calls[1]["messages"])
