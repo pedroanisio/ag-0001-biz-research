@@ -24,6 +24,7 @@ import httpx
 from . import pipeline
 from .crawler import Crawler
 from .errors import BiAgentError
+from .i18n import SUPPORTED
 from .llm import DEFAULT_MODEL, LLM, build_client
 
 STAGES_NEEDING_LLM = {"identify", "signals", "research", "analyze", "narrate", "run"}
@@ -36,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-pages", type=int, default=60)
     p.add_argument("--max-search-uses", type=int, default=8, help="web_search calls per research topic")
     p.add_argument("--delay", type=float, default=0.5, help="seconds between page fetches")
+    p.add_argument("--lang", choices=SUPPORTED, default=None,
+                   help="report language (default: the website's language, detected at crawl)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="stage", required=True)
     for name in ("run", "crawl"):
@@ -68,12 +71,15 @@ def main(
     store = pipeline.RunStore(Path(args.out))
     try:
         llm = make_llm(args, client_factory) if args.stage in STAGES_NEEDING_LLM else None
+        if args.lang and args.stage not in ("run", "crawl"):
+            store.set_lang(args.lang)
         if args.stage == "run":
-            md = pipeline.run_all(store, args.url, make_crawler(args, http_client), llm)
+            md = pipeline.run_all(store, args.url, make_crawler(args, http_client), llm, args.lang)
             print(f"report written to {store.path('report.md')} ({len(md)} chars)")
         elif args.stage == "crawl":
-            pages = pipeline.stage_crawl(store, args.url, make_crawler(args, http_client))
-            print(f"crawled {len(pages)} pages into {store.dir}")
+            pages = pipeline.stage_crawl(store, args.url, make_crawler(args, http_client), args.lang)
+            print(f"crawled {len(pages)} pages into {store.dir} (site language: {store.site_lang()}, "
+                  f"report language: {store.lang()})")
         elif args.stage == "identify":
             ident = pipeline.stage_identify(store, llm)
             print(f"identity: {ident.company_name.value or 'unknown'}")

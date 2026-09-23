@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .i18n import DEFAULT_LANG, LANGUAGE_NAMES, normalize_lang
 from .models import MATURITY_DIMENSIONS, STRATEGIC_QUESTIONS
 
 ANALYST_ROLE = """You are an autonomous business intelligence and company research analyst combining the
@@ -101,14 +102,61 @@ RESEARCH_TOPICS: dict[str, str] = {
 }
 
 
-def research_user_prompt(company: str, site: str, topic: str, guidance: str, known: str) -> str:
+# Where to look beyond the global sources, by the language of the company's website.
+LOCAL_SOURCES: dict[str, str] = {
+    "en": "national registries such as SEC EDGAR (US), Companies House (UK), ASIC (Australia), "
+          "Corporations Canada; reviews on G2, Capterra, Trustpilot, Glassdoor.",
+    "pt-br": "Brazil: CNPJ records (Receita Federal), Junta Comercial, CVM and B3 filings, Diário Oficial; "
+             "press such as Valor Econômico, Exame, Estadão, Folha, InfoMoney, NeoFeed, Startups.com.br; "
+             "reviews on Reclame Aqui, Glassdoor and app stores; jobs on LinkedIn, Gupy, Vagas.com.br. "
+             "Portugal: Portal da Justiça (publicações), CMVM.",
+    "fr": "France: Infogreffe, Pappers, Societe.com, BODACC, INPI, AMF filings; Belgium: BCE/KBO; "
+          "Switzerland: Zefix; press such as Les Echos, Le Monde, La Tribune, Maddyness, L'Usine Digitale; "
+          "reviews on Trustpilot, Avis Vérifiés, Glassdoor; jobs on Welcome to the Jungle, APEC, Indeed.",
+    "de": "Germany: Handelsregister / Unternehmensregister, Bundesanzeiger (Jahresabschlüsse), North Data; "
+          "Austria: Firmenbuch; Switzerland: Zefix / SHAB; press such as Handelsblatt, FAZ, WirtschaftsWoche, "
+          "Gründerszene, t3n; reviews on Kununu, Trusted Shops, Trustpilot; jobs on StepStone, LinkedIn, XING.",
+    "es": "Spain: BORME / Registro Mercantil, CNMV, eInforma, Axesor; Mexico: SIGER / Registro Público de "
+          "Comercio, BMV; Argentina: IGJ, CNV; Chile: CMF; Colombia: RUES, Superintendencia Financiera; "
+          "press such as Expansión, Cinco Días, El Economista, El País Economía, Forbes México; reviews on "
+          "Trustpilot, Glassdoor; jobs on InfoJobs, Computrabajo, LinkedIn.",
+}
+
+
+def output_language_block(lang: str | None) -> str:
+    """Instruction appended to every system prompt: prose in ``lang``, schema keys untouched."""
+    name = LANGUAGE_NAMES[normalize_lang(lang) or DEFAULT_LANG]
+    return f"""
+
+Output language: write every free-text value (statements, descriptions, answers, paragraphs,
+uncertainties, open questions, not_found entries) in {name}, whatever language the sources are in.
+Keep in English, exactly as specified: JSON field names, enum values, evidence ids, and the text of
+the strategic questions and maturity dimensions (they are keys; the report translates them).
+Keep proper names (companies, products, people, publications) as the sources write them."""
+
+
+def localized(system: str, lang: str | None) -> str:
+    return system + output_language_block(lang)
+
+
+def research_user_prompt(
+    company: str, site: str, topic: str, guidance: str, known: str, site_lang: str | None = DEFAULT_LANG
+) -> str:
+    lang = normalize_lang(site_lang) or DEFAULT_LANG
+    queries = (
+        "Run several distinct web_search queries in English"
+        if lang == "en"
+        else f"Run several distinct web_search queries both in {LANGUAGE_NAMES[lang]} (the website's language) "
+             "and in English"
+    )
     return f"""Company under investigation: {company}
 Website: {site}
+Website language: {LANGUAGE_NAMES[lang]}
 What is already known (from the website; treat as company claims):
 {known}
 
 Research topic: {topic} — {guidance}
-Run several distinct web_search queries (vary wording, include the company name and the domain), read the
-results, then call submit_findings with every reliable finding on this topic, each with the exact source
-URLs from the search results. Classify each finding correctly. List sub-topics with no reliable result in
-not_found."""
+Local sources worth searching for a company whose website is in this language: {LOCAL_SOURCES[lang]}
+{queries} (vary wording, include the company name and the domain), read the results, then call
+submit_findings with every reliable finding on this topic, each with the exact source URLs from the
+search results. Classify each finding correctly. List sub-topics with no reliable result in not_found."""

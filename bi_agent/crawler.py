@@ -1,7 +1,7 @@
 """Bounded, robots-respecting crawler for one company website.
 
 Pages are prioritised by path keywords that signal business content (about, pricing,
-products, careers, investors ...). Every loop is bounded by ``max_pages`` and
+products, careers, investors ...) in English, Portuguese, French, German and Spanish. Every loop is bounded by ``max_pages`` and
 ``max_fetches``; the crawler never follows off-site links.
 """
 
@@ -10,28 +10,86 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib import robotparser
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 from .errors import CrawlError
+from .i18n import guess_text_lang, normalize_lang
 
-PRIORITY_TERMS: dict[str, int] = {
-    "about": 10, "company": 8, "who-we-are": 8, "our-story": 8, "mission": 6,
-    "product": 10, "solution": 9, "service": 9, "platform": 8, "feature": 6,
-    "industr": 7, "customer": 8, "case-stud": 8, "case_stud": 8, "success": 5, "testimonial": 5,
-    "pricing": 10, "plans": 8, "partner": 7, "integration": 7, "marketplace": 6,
-    "developer": 6, "api": 6, "docs": 5, "documentation": 5, "resource": 3,
-    "blog": 2, "news": 4, "press": 5, "media": 3, "career": 7, "jobs": 7, "join": 4,
-    "investor": 9, "ir": 4, "security": 5, "compliance": 5, "trust": 5, "privacy": 3,
-    "terms": 3, "legal": 3, "contact": 4, "team": 6, "leadership": 8, "management": 6,
-    "faq": 4, "why": 4, "compare": 6, "vs": 5, "enterprise": 6,
-}
+# Business-content concepts and the path words that signal them in en / pt-br / fr / de / es.
+# Paths are lower-cased, percent-decoded and stripped of accents before matching, so "preços",
+# "pre%C3%A7os" and "precos" all hit. A concept counts once per path segment however many of its
+# words match. Words of three letters or fewer must equal a whole hyphen/underscore token, so "ri"
+# (relações com investidores) matches "/ri" but not "/pricing".
+PRIORITY_CONCEPTS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (10, ("about", "sobre", "quem-somos", "a-propos", "apropos", "qui-sommes", "ueber-uns", "uber-uns",
+          "acerca", "quienes-somos", "nosotros")),
+    (8, ("company", "empresa", "entreprise", "societe", "unternehmen", "institucional", "institutionnel",
+         "who-we-are", "our-story", "nossa-historia", "historia", "histoire", "geschichte")),
+    (6, ("mission", "missao", "mision", "leitbild", "valores", "valeurs", "werte")),
+    (10, ("product", "produto", "produit", "produkt", "producto")),
+    (9, ("solution", "solucao", "solucoes", "solucion", "loesung", "losung")),
+    (9, ("service", "servico", "servicio", "leistung")),
+    (8, ("platform", "plataforma", "plateforme", "plattform")),
+    (6, ("feature", "funcionalidade", "funcionalidad", "fonctionnalite", "funktion", "recursos")),
+    (7, ("industr", "setor", "sector", "secteur", "branche")),
+    (8, ("customer", "client", "kunde", "referenc", "referenz")),
+    (8, ("case-stud", "case_stud", "casos", "cas-client", "etude-de-cas", "etudes-de-cas", "fallstudie")),
+    (5, ("success", "sucesso", "exito", "erfolg")),
+    (5, ("testimonial", "depoimento", "testimonio", "temoignage", "kundenstimme")),
+    (10, ("pricing", "price", "preco", "precio", "prix", "tarif", "preise")),
+    (8, ("plans", "planos", "planes", "offres", "abonnement")),
+    (8, ("portfolio", "portafolio", "portefeuille", "investimentos", "investments", "inversiones")),
+    (7, ("partner", "parceir", "partenaire", "alianza", "aliados", "socios")),
+    (7, ("integration", "integrac", "integracion")),
+    (6, ("marketplace",)),
+    (6, ("developer", "desenvolvedor", "desarrollador", "developpeur", "entwickler")),
+    (6, ("api",)),
+    (5, ("docs", "documentation", "documentacao", "documentacion", "dokumentation")),
+    (3, ("resource", "ressource", "materiais", "materiales")),
+    (2, ("blog",)),
+    (4, ("news", "noticia", "novidade", "actualite", "actualidad", "aktuell", "nachricht", "neuigkeit")),
+    (5, ("press", "imprensa", "prensa", "presse")),
+    (3, ("media", "midia", "medios", "medien")),
+    (7, ("career", "carreira", "carrera", "carriere", "karriere", "jobs", "vagas", "trabalhe", "empleo",
+         "emploi", "recrutement", "stellen")),
+    (4, ("join",)),
+    (9, ("investor", "investidor", "inversor", "inversionista", "investisseur")),
+    (4, ("ir", "ri")),
+    (5, ("security", "seguranca", "seguridad", "securite", "sicherheit")),
+    (5, ("compliance", "conformidade", "conformite", "cumplimiento")),
+    (5, ("trust", "confianca", "confianza", "confiance", "vertrauen")),
+    (3, ("privacy", "privacidade", "privacidad", "confidentialite", "datenschutz", "lgpd", "rgpd", "dsgvo", "gdpr")),
+    (3, ("terms", "termos", "terminos", "conditions", "cgu", "cgv", "agb", "nutzungsbedingungen")),
+    (3, ("legal", "juridico", "mentions-legales", "impressum", "aviso-legal")),
+    (4, ("contact", "contato", "contacto", "kontakt", "fale-conosco")),
+    (6, ("team", "equipe", "equipo")),
+    (8, ("leadership", "lideranca", "liderazgo", "fuehrung", "direction")),
+    (6, ("management", "gestao", "gestion", "diretoria", "directorio", "vorstand", "geschaeftsfuehrung")),
+    (4, ("faq", "perguntas-frequentes", "preguntas-frecuentes", "duvidas", "haeufige-fragen")),
+    (4, ("why", "por-que", "porque", "pourquoi", "warum")),
+    (6, ("compare", "comparar", "comparatif", "comparacao", "comparacion", "vergleich")),
+    (5, ("vs",)),
+    (6, ("enterprise", "corporativo", "grandes-empresas")),
+)
+FEED_SECTIONS = frozenset((
+    "news", "blog", "press", "resources", "media", "articles", "posts", "events",
+    "noticias", "novidades", "imprensa", "artigos", "eventos", "materiais", "recursos", "midia",
+    "actualites", "presse", "evenements", "ressources",
+    "aktuelles", "nachrichten", "beitraege", "veranstaltungen", "medien", "artikel",
+    "actualidad", "prensa", "articulos", "medios",
+))
+# First path segments that select a language version of the site ("/en/", "/pt-br/", "/de_DE/").
+LOCALE_SEGMENT = re.compile(
+    r"^(en|pt|fr|de|es|it|nl|ja|zh|ko|ru|pl|sv|da|no|nb|fi|tr|ar|he|cs)([-_][a-z]{2,4})?$"
+)
 SKIP_EXTENSIONS = (
     ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".css", ".js",
     ".zip", ".mp4", ".mp3", ".woff", ".woff2", ".ttf", ".xml", ".json", ".rss", ".atom",
@@ -84,21 +142,50 @@ def same_site(url: str, root_host: str) -> bool:
     return h == root_host or h.endswith("." + root_host)
 
 
-FEED_SECTIONS = ("news", "blog", "press", "resources", "media", "articles", "posts", "events")
+def _normalize_segment(seg: str) -> str:
+    seg = unquote(seg).lower()
+    seg = unicodedata.normalize("NFKD", seg)
+    return "".join(ch for ch in seg if not unicodedata.combining(ch))
 
 
-def score_path(url: str, depth: int) -> int:
-    """Higher is fetched first. Section pages outrank individual posts under feed sections."""
+def _segment_score(seg: str) -> int:
+    tokens = set(re.split(r"[-_.]+", seg))
+    total = 0
+    for weight, words in PRIORITY_CONCEPTS:
+        if any((w in tokens) if len(w) <= 3 else (w in seg) for w in words):
+            total += weight
+    return total
+
+
+def locale_of(url: str) -> str | None:
+    """The language subtag of a locale prefix such as ``/pt-br/``, or None."""
     segments = [s for s in urlparse(url).path.lower().split("/") if s]
+    if segments and (m := LOCALE_SEGMENT.match(segments[0])):
+        return m.group(1)
+    return None
+
+
+def score_path(url: str, depth: int, site_lang: str | None = None) -> int:
+    """Higher is fetched first. Section pages outrank individual posts under feed sections.
+
+    A leading locale segment is ignored for keyword scoring; when ``site_lang`` is known, pages
+    under a different locale prefix (another language version of the same site) are pushed back.
+    """
+    segments = [_normalize_segment(s) for s in urlparse(url).path.split("/") if s]
+    penalty = 0
+    if segments and (m := LOCALE_SEGMENT.match(segments[0])):
+        if site_lang and m.group(1) != site_lang:
+            penalty = 12
+        segments = segments[1:]
     score = 10 if not segments else 0
     for i, seg in enumerate(segments):
-        matched = sum(w for term, w in PRIORITY_TERMS.items() if term in seg)
+        matched = _segment_score(seg)
         score += matched if i == 0 else matched // 3  # a keyword in a deep slug is weak evidence
     if len(segments) > 1 and segments[0] in FEED_SECTIONS:
         score -= 8
     score -= 2 * len(segments)  # shallower pages first
     score -= 3 * depth
-    return score
+    return score - penalty
 
 
 def extract(url: str, html: str, status: int = 200) -> Page:
@@ -236,6 +323,7 @@ class Crawler:
         seen: set[str] = {start}
         recorded: set[str] = set()  # final URLs after redirects, so one page is never stored twice
         frontier: list[tuple[int, int, str]] = []  # (score, depth, url)
+        site_lang: str | None = locale_of(start)  # primary subtag of the version we landed on
 
         def push(url: str, depth: int) -> None:
             if url in seen or not same_site(url, root_host):
@@ -243,11 +331,14 @@ class Crawler:
             if urlparse(url).path.lower().endswith(SKIP_EXTENSIONS):
                 return
             seen.add(url)
-            frontier.append((score_path(url, depth), depth, url))
+            frontier.append((score_path(url, depth, site_lang), depth, url))
 
         home = self._accept(first, start, depth=0, root_host=root_host, recorded=recorded)
         if home is not None:
             pages.append(home)
+            if site_lang is None:
+                lang = guess_text_lang(home.text) or normalize_lang(home.lang)
+                site_lang = lang.split("-")[0] if lang else None
             for link in home.links:
                 push(link, 1)
         for sm_url in self._sitemap_urls(root, rp):

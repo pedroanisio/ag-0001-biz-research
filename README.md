@@ -29,7 +29,16 @@ bi-agent --out runs/acme narrate                             # narrative.json
 bi-agent --out runs/acme report                              # report.md
 ```
 
-Options: `--model` (default `claude-sonnet-4-5`, or `BI_AGENT_MODEL`), `--max-pages` (60), `--max-search-uses` per research topic (8), `--delay` between page fetches (0.5 s), `-v`.
+Options: `--model` (default `claude-sonnet-4-5`, or `BI_AGENT_MODEL`), `--lang` (see below), `--max-pages` (60), `--max-search-uses` per research topic (8), `--delay` between page fetches (0.5 s), `-v`. Global options go before the stage name, and `--url` goes after it.
+
+## Languages
+
+Supported: English (`en`), Brazilian Portuguese (`pt-br`), French (`fr`), German (`de`) and Spanish (`es`).
+
+- **Detection.** The crawl stage works out the site's language from the page text (a stop-word vote), falling back to `<html lang>` and then to English. The text comes first because many templates ship `lang="en-US"` over Portuguese or Spanish content. The result is saved as `site_lang` in `run.json`.
+- **Crawling.** Page-priority keywords cover all five languages (`/sobre`, `/quem-somos`, `/a-propos`, `/ueber-uns`, `/quienes-somos`, `/precos`, `/carreiras` …). Paths are matched without accents or percent-encoding, so `/preços` counts as `/precos`. A locale prefix such as `/pt-br/` is ignored for scoring, and other language versions of the same site (`/en/…` on a Portuguese site) are fetched last.
+- **Research.** The model searches in the site's language and in English, and gets that language's local registries, press, review and job sites (Receita Federal / Reclame Aqui, Infogreffe / Pappers, Handelsregister / Kununu, BORME / CNMV …).
+- **Report language.** The report is written in the site's language by default. `--lang` overrides it, and it can be passed to any stage: `bi-agent --out runs/acme --lang de report` re-renders an existing run's headings and labels. Prose the model already wrote stays in its original language until `narrate` (and the stages before it) are re-run. The model always returns the strategic questions, maturity dimensions and enum values as English keys, and the renderer translates them (`bi_agent/i18n.py`).
 
 ## How the evidence discipline is enforced
 
@@ -38,7 +47,7 @@ Every model output crosses a typed boundary with five controls:
 1. **Typed parse that rejects unknown fields.** Each stage forces a tool call whose input schema is a pydantic model with `extra="forbid"` (`bi_agent/models.py`).
 2. **Semantic validation the schema cannot express.** Every `evidence_ids` entry and every inline `[E###]` citation must resolve in the evidence ledger; `verified_fact` requires at least one third-party source; `company_claim` requires a first-party source; the ten strategic questions and eight maturity dimensions must appear with their exact text; market sizing requires a source, year, methodology and limitations (`models.semantic_errors`).
 3. **Defined failure path with a typed error.** Validation errors are fed back to the model for a bounded number of attempts, then `LLMOutputError` carries the error list to the CLI (exit code 2).
-4. **Adversarial tests.** `tests/` feed unknown fields, fabricated evidence ids, mis-classified claims, unsearched source URLs, text-only model turns, search error blocks, off-site redirects and robots-blocked paths, and assert the failure behaviour. 59 tests, 98.5 % branch coverage, no network.
+4. **Adversarial tests.** `tests/` feed unknown fields, fabricated evidence ids, mis-classified claims, unsearched source URLs, text-only model turns, search error blocks, off-site redirects and robots-blocked paths, and assert the failure behaviour. 98 tests, 98.6 % branch coverage, no network.
 5. **Loop bounds owned by ordinary code.** `max_pages`, `max_fetches`, `max_attempts`, `max_research_turns`, `max_search_uses`, five sitemaps, twelve research topics.
 
 The research stage adds one more guard: a finding's source URL is accepted only if `web_search` returned that URL in the same call (or it belongs to the company's own site). Findings whose sources the model reconstructed are discarded and listed at the end of the report under "Discarded during verification".
@@ -52,6 +61,7 @@ bi_agent/llm.py       Anthropic wrapper: forced structured output, bounded retri
 bi_agent/prompts.py   the analyst brief per stage (the research spec lives here)
 bi_agent/pipeline.py  stages and the run directory
 bi_agent/report.py    Markdown renderer (adds no facts)
+bi_agent/i18n.py      supported languages, site-language detection, translated report strings
 bi_agent/cli.py       subcommands
 ```
 

@@ -3,7 +3,7 @@ artifact, and can be executed on its own. ``run_all`` chains them.
 
 Run directory layout::
 
-    run.json        start url, timestamps
+    run.json        start url, timestamps, site language and report language
     pages.json      crawled pages
     evidence.json   evidence ledger (first- and third-party)
     identity.json   Identity
@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from . import prompts
 from .crawler import Crawler, Page, canonical, registrable_host, same_site
 from .errors import StageError
+from .i18n import DEFAULT_LANG, SUPPORTED, detect_site_lang, normalize_lang
 from .llm import LLM, SearchHit, pretty
 from .models import (
     Analysis,
@@ -69,20 +70,20 @@ class RunStore:
         return self.path(name).exists()
 
     def save_model(self, name: str, obj: BaseModel) -> None:
-        self.path(name).write_text(json.dumps(obj.model_dump(mode="json"), indent=2, ensure_ascii=False))
+        self.path(name).write_text(json.dumps(obj.model_dump(mode="json"), indent=2, ensure_ascii=False), encoding="utf-8")
 
     def load_model(self, name: str, schema: type[T]) -> T:
         if not self.exists(name):
             raise StageError(f"missing {name}; run the earlier stage first")
-        return schema.model_validate(json.loads(self.path(name).read_text()))
+        return schema.model_validate(json.loads(self.path(name).read_text(encoding="utf-8")))
 
     def save_json(self, name: str, data: Any) -> None:
-        self.path(name).write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        self.path(name).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def load_json(self, name: str) -> Any:
         if not self.exists(name):
             raise StageError(f"missing {name}; run the earlier stage first")
-        return json.loads(self.path(name).read_text())
+        return json.loads(self.path(name).read_text(encoding="utf-8"))
 
     def ledger(self) -> EvidenceLedger:
         if not self.exists("evidence.json"):
@@ -95,12 +96,29 @@ class RunStore:
     def meta(self) -> dict:
         return self.load_json("run.json")
 
+    def site_lang(self) -> str:
+        return self.meta().get("site_lang", DEFAULT_LANG)
+
+    def lang(self) -> str:
+        """Language the report is written in: ``--lang`` if given, else the site's language."""
+        meta = self.meta()
+        return meta.get("lang") or meta.get("site_lang", DEFAULT_LANG)
+
+    def set_lang(self, lang: str) -> None:
+        code = normalize_lang(lang)
+        if code is None:
+            raise StageError(f"unsupported language {lang!r}; choose from {', '.join(SUPPORTED)}")
+        meta = self.meta()
+        meta["lang"] = code
+        self.save_json("run.json", meta)
+
 
 # --------------------------------------------------------------------------- stage: crawl
 
 
-def stage_crawl(store: RunStore, url: str, crawler: Crawler) -> list[Page]:
+def stage_crawl(store: RunStore, url: str, crawler: Crawler, lang: str | None = None) -> list[Page]:
     pages = crawler.crawl(url)
+    site_lang = detect_site_lang(pages)
     ledger = EvidenceLedger()
     for p in pages:
         ledger.add(
@@ -109,10 +127,12 @@ def stage_crawl(store: RunStore, url: str, crawler: Crawler) -> list[Page]:
             excerpt=(p.description + "\n" + p.text)[:1500], retrieved_at=p.fetched_at,
         )
     store.save_json("run.json", {"url": url, "start": pages[0].url if pages else url, "started_at": now_iso(),
-                                 "pages": len(pages)})
+                                 "pages": len(pages), "site_lang": site_lang, "lang": None})
+    if lang:
+        store.set_lang(lang)
     store.save_json("pages.json", [p.to_dict() for p in pages])
     store.save_ledger(ledger)
-    log.info("crawled %d pages, %d evidence items", len(pages), len(ledger))
+    log.info("crawled %d pages, %d evidence items, site language %s", len(pages), len(ledger), site_lang)
     return pages
 
 
@@ -145,7 +165,7 @@ def stage_identify(store: RunStore, llm: LLM) -> Identity:
     meta = store.meta()
     user = f"Start URL: {meta['url']}\n\nCrawled pages (each with its evidence id):\n{_pages_block(store, ledger, 120_000)}"
     identity = llm.structured(
-        system=prompts.IDENTIFY_SYSTEM, user=user, schema=Identity, tool_name="submit_identity",
+        system=prompts.localized(prompts.IDENTIFY_SYSTEM, store.lang()), user=user, schema=Identity, tool_name="submit_identity",
         semantic_check=lambda o: semantic_errors(o, ledger),
     )
     store.save_model("identity.json", identity)
@@ -163,7 +183,7 @@ def stage_signals(store: RunStore, llm: LLM) -> SiteSignals:
         f"{_pages_block(store, ledger)}"
     )
     signals = llm.structured(
-        system=prompts.SIGNALS_SYSTEM, user=user, schema=SiteSignals, tool_name="submit_site_signals",
+        system=prompts.localized(prompts.SIGNALS_SYSTEM, store.lang()), user=user, schema=SiteSignals, tool_name="submit_site_signals",
         semantic_check=lambda o: semantic_errors(o, ledger),
     )
     store.save_model("signals.json", signals)
@@ -231,10 +251,11 @@ def stage_research(store: RunStore, llm: LLM, topics: dict[str, str] | None = No
     all_findings: list[Finding] = []
     not_found: list[str] = []
     rejected: list[str] = []
+    system = prompts.localized(prompts.RESEARCH_SYSTEM, store.lang())
     for topic, guidance in (topics or prompts.RESEARCH_TOPICS).items():
-        user = prompts.research_user_prompt(company, meta["start"], topic, guidance, known)
+        user = prompts.research_user_prompt(company, meta["start"], topic, guidance, known, store.site_lang())
         try:
-            raw, hits = llm.researched(system=prompts.RESEARCH_SYSTEM, user=user, schema=RawFindings)
+            raw, hits = llm.researched(system=system, user=user, schema=RawFindings)
         except Exception as exc:  # noqa: BLE001 - one failed topic must not sink the run
             log.warning("research topic %s failed: %s", topic, exc)
             not_found.append(f"{topic}: research call failed ({type(exc).__name__})")
@@ -265,7 +286,7 @@ def stage_analyze(store: RunStore, llm: LLM) -> Analysis:
         + "\n\nEXTERNAL FINDINGS:\n" + pretty(findings)
     )
     analysis = llm.structured(
-        system=prompts.ANALYZE_SYSTEM, user=user, schema=Analysis, tool_name="submit_analysis",
+        system=prompts.localized(prompts.ANALYZE_SYSTEM, store.lang()), user=user, schema=Analysis, tool_name="submit_analysis",
         semantic_check=lambda o: semantic_errors(o, ledger),
     )
     store.save_model("analysis.json", analysis)
@@ -287,7 +308,7 @@ def stage_narrate(store: RunStore, llm: LLM) -> Narrative:
         + "\n\nEXTERNAL FINDINGS:\n" + pretty(findings)
     )
     narrative = llm.structured(
-        system=prompts.NARRATE_SYSTEM, user=user, schema=Narrative, tool_name="submit_narrative",
+        system=prompts.localized(prompts.NARRATE_SYSTEM, store.lang()), user=user, schema=Narrative, tool_name="submit_narrative",
         semantic_check=lambda o: check_refs(o, ledger),
     )
     store.save_model("narrative.json", narrative)
@@ -308,13 +329,14 @@ def stage_report(store: RunStore) -> str:
         narrative=store.load_model("narrative.json", Narrative),
         ledger=ledger,
         access_date=now_iso()[:10],
+        lang=store.lang(),
     )
-    store.path("report.md").write_text(md)
+    store.path("report.md").write_text(md, encoding="utf-8")
     return md
 
 
-def run_all(store: RunStore, url: str, crawler: Crawler, llm: LLM) -> str:
-    stage_crawl(store, url, crawler)
+def run_all(store: RunStore, url: str, crawler: Crawler, llm: LLM, lang: str | None = None) -> str:
+    stage_crawl(store, url, crawler, lang)
     stage_identify(store, llm)
     stage_signals(store, llm)
     stage_research(store, llm)

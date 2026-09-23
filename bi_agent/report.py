@@ -1,13 +1,15 @@
 """Render the Company Intelligence Report (Markdown) from validated stage outputs.
 
 The renderer adds no facts. It lays out narrative prose, structured tables, and the sources
-list, and marks every claim with its classification.
+list, and marks every claim with its classification. Every heading, label and fixed sentence
+comes from :mod:`bi_agent.i18n`, so the report reads in the run's language.
 """
 
 from __future__ import annotations
 
 import re
 
+from .i18n import Translator
 from .models import (
     Analysis,
     Attr,
@@ -20,13 +22,6 @@ from .models import (
     SiteSignals,
 )
 
-LABEL = {
-    "verified_fact": "Verified fact",
-    "company_claim": "Company claim",
-    "third_party_claim": "Third-party claim",
-    "analytical_inference": "Analytical inference",
-    "unknown": "Unknown",
-}
 _ID_RE = re.compile(r"E\d{3,}")
 
 
@@ -36,20 +31,6 @@ def _cell(text: str) -> str:
 
 def _cites(ids: list[str]) -> str:
     return " ".join(f"[{i}]" for i in ids)
-
-
-def _claim_line(c: Claim) -> str:
-    return f"- {c.statement} *({LABEL[c.classification.value]})* {_cites(c.evidence_ids)}".rstrip()
-
-
-def _claims(items: list[Claim], empty: str = "Nothing established from the evidence gathered.") -> str:
-    return "\n".join(_claim_line(c) for c in items) if items else f"_{empty}_"
-
-
-def _attr(a: Attr) -> str:
-    if a.value is None:
-        return "Unknown"
-    return f"{_cell(a.value)} *({LABEL[a.classification.value]})* {_cites(a.evidence_ids)}".rstrip()
 
 
 def _paras(paragraphs: list[str]) -> str:
@@ -63,6 +44,10 @@ def _cited_ids(*texts: str) -> set[str]:
     return found
 
 
+def _head(*cells: str) -> str:
+    return "| " + " | ".join(cells) + " |\n|" + "---|" * len(cells)
+
+
 def render_report(
     *,
     meta: dict,
@@ -73,195 +58,202 @@ def render_report(
     narrative: Narrative,
     ledger: EvidenceLedger,
     access_date: str,
+    lang: str = "en",
 ) -> str:
+    t = Translator(lang)
     n = narrative
     a = analysis
-    name = identity.company_name.value or meta.get("start", meta.get("url", "the company"))
+
+    def label(cls: object) -> str:
+        return t(getattr(cls, "value", cls))
+
+    def claim_line(c: Claim) -> str:
+        return f"- {c.statement} *({label(c.classification)})* {_cites(c.evidence_ids)}".rstrip()
+
+    def claims(items: list[Claim], empty: str = "nothing") -> str:
+        return "\n".join(claim_line(c) for c in items) if items else f"_{t(empty)}_"
+
+    def attr(x: Attr) -> str:
+        if x.value is None:
+            return t("unknown")
+        return f"{_cell(x.value)} *({label(x.classification)})* {_cites(x.evidence_ids)}".rstrip()
+
+    def section(num: int, paras: list[str] | None = None) -> None:
+        w(f"## {num}. {t(f's{num}')}\n")
+        if paras is not None:
+            w(_paras(paras) + "\n")
+
+    def sub(key: str, content: str) -> None:
+        w(f"**{t(key)}**\n\n{content}\n")
+
+    name = identity.company_name.value or meta.get("start", meta.get("url", t("the_company")))
     out: list[str] = []
     w = out.append
 
-    w(f"# Company Intelligence Report: {name}\n")
-    w(f"Subject URL: {meta.get('url')}  \nReport generated: {access_date}  \n"
-      f"Evidence items: {len(ledger)} (website pages crawled: {meta.get('pages', 0)})\n")
-    w("Classification key: every claim carries one of *Verified fact*, *Company claim*, "
-      "*Third-party claim*, *Analytical inference*, or *Unknown*. Bracketed ids such as [E012] "
-      "resolve to the Sources section.\n")
+    w(f"# {t('title', name=name)}\n")
+    w(f"{t('subject_url')}: {meta.get('url')}  \n{t('generated')}: {access_date}  \n"
+      f"{t('evidence_items', n=len(ledger), pages=meta.get('pages', 0))}\n")
+    labels = [f"*{t(k)}*" for k in ("verified_fact", "company_claim", "third_party_claim", "analytical_inference", "unknown")]
+    w(t("key", labels=", ".join(labels[:-1]) + f" {t('or')} " + labels[-1]) + "\n")
 
-    w("## 1. Executive Summary\n")
-    w(_paras(n.executive_summary) + "\n")
+    section(1, n.executive_summary)
 
-    w("## 2. Company Snapshot\n")
-    w("| Field | Value |\n|---|---|")
+    section(2)
+    w(_head(t("field"), t("value")))
     rows = [
-        ("Company", _attr(identity.company_name)), ("Legal entity", _attr(identity.legal_name)),
-        ("Website", meta.get("start", meta.get("url", ""))), ("Headquarters", _attr(identity.headquarters)),
-        ("Founded", _attr(identity.founding_year)), ("Founders", _attr(identity.founders)),
-        ("Ownership", _attr(identity.ownership_structure)),
-        ("Public / private", _attr(identity.public_private_status)), ("Ticker", _attr(identity.stock_ticker)),
-        ("Parent company", _attr(identity.parent_company)), ("Subsidiaries", _attr(identity.subsidiaries)),
-        ("Brands", _attr(identity.brands)), ("Leadership", _attr(identity.leadership)),
-        ("Industry", _attr(identity.primary_industry)), ("Adjacent industries", _attr(identity.adjacent_industries)),
-        ("Core market", _cell(a.market.primary_market.statement) + f" {_cites(a.market.primary_market.evidence_ids)}"),
-        ("Business model", "; ".join(_cell(c.statement) for c in a.business_model.revenue_model)),
-        ("Customer type", _cell(a.business_model.customer_type.statement)),
-        ("Geographic presence", _attr(identity.countries_of_operation)),
+        ("company", attr(identity.company_name)), ("legal_entity", attr(identity.legal_name)),
+        ("website", meta.get("start", meta.get("url", ""))), ("headquarters", attr(identity.headquarters)),
+        ("founded", attr(identity.founding_year)), ("founders", attr(identity.founders)),
+        ("ownership", attr(identity.ownership_structure)),
+        ("public_private", attr(identity.public_private_status)), ("ticker", attr(identity.stock_ticker)),
+        ("parent", attr(identity.parent_company)), ("subsidiaries", attr(identity.subsidiaries)),
+        ("brands", attr(identity.brands)), ("leadership", attr(identity.leadership)),
+        ("industry", attr(identity.primary_industry)), ("adjacent_industries", attr(identity.adjacent_industries)),
+        ("core_market", _cell(a.market.primary_market.statement) + f" {_cites(a.market.primary_market.evidence_ids)}"),
+        ("business_model", "; ".join(_cell(c.statement) for c in a.business_model.revenue_model)),
+        ("customer_type", _cell(a.business_model.customer_type.statement)),
+        ("geo_presence", attr(identity.countries_of_operation)),
     ]
     for k, v in rows:
-        w(f"| {k} | {v} |")
+        w(f"| {t(k)} | {v} |")
     if identity.identity_uncertainties:
-        w("\n**Identity uncertainties**\n")
+        w(f"\n**{t('identity_uncertainties')}**\n")
         for u in identity.identity_uncertainties:
             w(f"- {u}")
     w("")
 
-    w("## 3. What the Company Does\n")
-    w(_paras(n.what_the_company_does) + "\n")
+    section(3, n.what_the_company_does)
 
-    w("## 4. Problems It Solves\n")
-    w(_paras(n.problems_it_solves) + "\n")
-    w("| Pain type | Problem | Consequence if unsolved | Evidence |\n|---|---|---|---|")
+    section(4, n.problems_it_solves)
+    w(_head(t("pain_type"), t("problem"), t("consequence"), t("evidence")))
     for p in a.pains:
-        w(f"| {p.kind.value} | {_cell(p.description)} | {_cell(p.consequence_if_unsolved)} | {_cites(p.evidence_ids)} |")
+        w(f"| {t('pain.' + p.kind.value)} | {_cell(p.description)} | {_cell(p.consequence_if_unsolved)} | {_cites(p.evidence_ids)} |")
     w("")
 
-    w("## 5. Products and Services\n")
-    w(_paras(n.products_and_services) + "\n")
-    w("| Offering | Target Customer | Problem Solved | Key Capabilities | Business Benefit | Monetization | Basis |\n"
-      "|---|---|---|---|---|---|---|")
+    section(5, n.products_and_services)
+    w(_head(t("offering"), t("target_customer"), t("problem_solved"), t("capabilities"), t("benefit"),
+            t("monetization"), t("basis")))
     for o in signals.offerings:
         w(f"| {_cell(o.name)} | {_cell(o.target_customer)} | {_cell(o.problem_solved)} | {_cell(o.key_capabilities)} | "
-          f"{_cell(o.business_benefit)} | {_cell(o.monetization)} | {LABEL[o.classification.value]} {_cites(o.evidence_ids)} |")
+          f"{_cell(o.business_benefit)} | {_cell(o.monetization)} | {label(o.classification)} {_cites(o.evidence_ids)} |")
     if not signals.offerings:
-        w("| — | — | — | — | — | — | No offerings could be extracted from the website |")
+        w(f"| — | — | — | — | — | — | {t('no_offerings')} |")
     w("")
 
-    w("## 6. Customer Segments and Use Cases\n")
-    w(_paras(n.customer_segments_and_use_cases) + "\n")
-    w("**Segments**\n\n" + _claims(signals.customer_segments) + "\n")
-    w("**Target industries**\n\n" + _claims(signals.target_industries) + "\n")
-    w("**Use cases**\n\n" + _claims(signals.use_cases) + "\n")
+    section(6, n.customer_segments_and_use_cases)
+    sub("segments", claims(signals.customer_segments))
+    sub("target_industries", claims(signals.target_industries))
+    sub("use_cases", claims(signals.use_cases))
 
-    w("## 7. Business Model and Monetization\n")
-    w(_paras(n.business_model_and_monetization) + "\n")
+    section(7, n.business_model_and_monetization)
     bm = a.business_model
-    w("**Customer type**\n\n" + _claim_line(bm.customer_type) + "\n")
-    w("**Ideal customer profile**\n\n" + _claim_line(bm.ideal_customer_profile) + "\n")
-    w("**Buyer, user and economic decision maker**\n\n" + _claim_line(bm.buyer_user_decision_maker) + "\n")
-    w("**Revenue model**\n\n" + _claims(bm.revenue_model) + "\n")
-    w("**Pricing signals from the website**\n\n" + _claims(signals.pricing_model, "No pricing information published.") + "\n")
+    sub("customer_type", claim_line(bm.customer_type))
+    sub("icp", claim_line(bm.ideal_customer_profile))
+    sub("buyer_user", claim_line(bm.buyer_user_decision_maker))
+    sub("revenue_model", claims(bm.revenue_model))
+    sub("pricing_signals", claims(signals.pricing_model, "no_pricing"))
 
-    w("## 8. Go-to-Market Strategy\n")
-    w(_paras(n.go_to_market) + "\n")
-    w(_claims(bm.go_to_market) + "\n")
-    w("**Sales and distribution signals from the website**\n\n" + _claims(signals.sales_and_distribution) + "\n")
+    section(8, n.go_to_market)
+    w(claims(bm.go_to_market) + "\n")
+    sub("sales_signals", claims(signals.sales_and_distribution))
 
-    w("## 9. Technology and Intellectual Property\n")
-    w(_paras(n.technology_and_ip) + "\n")
-    w("**Observed technology signals**\n\n" + _claims(a.technology + signals.technology) + "\n")
-    w("**IP, regulatory and certification claims**\n\n" + _claims(signals.ip_regulatory_certifications) + "\n")
+    section(9, n.technology_and_ip)
+    sub("tech_signals", claims(a.technology + signals.technology))
+    sub("ip_claims", claims(signals.ip_regulatory_certifications))
 
-    w("## 10. Market Landscape\n")
-    w(_paras(n.market_landscape) + "\n")
+    section(10, n.market_landscape)
     m = a.market
-    w("**Primary market**\n\n" + _claim_line(m.primary_market) + "\n")
-    w("**Adjacent markets**\n\n" + _claims(m.adjacent_markets) + "\n")
-    w("**Market maturity**\n\n" + _claim_line(m.maturity) + "\n")
-    w("**Structural trends**\n\n" + _claims(m.structural_trends) + "\n")
-    w("**Technological shifts**\n\n" + _claims(m.technological_shifts) + "\n")
-    w("**Regulatory influences**\n\n" + _claims(m.regulatory_influences) + "\n")
-    w("**Customer behaviour changes**\n\n" + _claims(m.customer_behavior_changes) + "\n")
-    w("**Barriers to entry**\n\n" + _claims(m.barriers_to_entry) + "\n")
-    w("**Switching costs**\n\n" + _claim_line(m.switching_costs) + "\n")
-    w("**Commoditization risk**\n\n" + _claim_line(m.commoditization_risk) + "\n")
-    w("**Consolidation dynamics**\n\n" + _claim_line(m.consolidation_dynamics) + "\n")
-    w("**Market sizing**\n")
+    sub("primary_market", claim_line(m.primary_market))
+    sub("adjacent_markets", claims(m.adjacent_markets))
+    sub("market_maturity", claim_line(m.maturity))
+    sub("trends", claims(m.structural_trends))
+    sub("tech_shifts", claims(m.technological_shifts))
+    sub("regulatory", claims(m.regulatory_influences))
+    sub("behaviour", claims(m.customer_behavior_changes))
+    sub("barriers", claims(m.barriers_to_entry))
+    sub("switching", claim_line(m.switching_costs))
+    sub("commoditization", claim_line(m.commoditization_risk))
+    sub("consolidation", claim_line(m.consolidation_dynamics))
+    w(f"**{t('sizing')}**\n")
     if m.sizing:
-        w("| Metric | Value | Year | Methodology | Limitations | Source |\n|---|---|---|---|---|---|")
+        w(_head(t("metric"), t("value"), t("year"), t("methodology"), t("limitations"), t("source")))
         for s in m.sizing:
             w(f"| {s.metric} | {_cell(s.value)} | {s.year} | {_cell(s.methodology)} | {_cell(s.limitations)} | {_cites(s.evidence_ids)} |")
     else:
-        w("_No credible sourced market-size figure was found; none is estimated here._")
+        w(f"_{t('no_sizing')}_")
     w("")
 
-    w("## 11. Competitive Landscape\n")
-    w(_paras(n.competitive_landscape) + "\n")
-    w("| Company | Category | Offering | Target Segment | Business Model | Key Strength | Key Difference | Basis |\n"
-      "|---|---|---|---|---|---|---|---|")
+    section(11, n.competitive_landscape)
+    w(_head(t("company"), t("category"), t("offering"), t("target_segment"), t("business_model"),
+            t("strength"), t("difference"), t("basis")))
     order = {c: i for i, c in enumerate(CompetitorCategory)}
     for c in sorted(a.competitors, key=lambda x: order[x.category]):
-        w(f"| {_cell(c.name)} | {c.category.value.replace('_', ' ')} | {_cell(c.offering)} | {_cell(c.target_segment)} | "
+        w(f"| {_cell(c.name)} | {t('cat.' + c.category.value)} | {_cell(c.offering)} | {_cell(c.target_segment)} | "
           f"{_cell(c.business_model)} | {_cell(c.key_strength)} | {_cell(c.key_difference)} | "
-          f"{LABEL[c.classification.value]} {_cites(c.evidence_ids)} |")
+          f"{label(c.classification)} {_cites(c.evidence_ids)} |")
     w("")
 
-    w("## 12. Differentiation and Defensibility\n")
-    w(_paras(n.differentiation_and_defensibility) + "\n")
-    w("| Dimension | Claimed differentiation | Observable differentiation | Reproducibility | Evidence |\n|---|---|---|---|---|")
+    section(12, n.differentiation_and_defensibility)
+    w(_head(t("dimension"), t("claimed_diff"), t("observable_diff"), t("reproducibility"), t("evidence")))
     for d in a.differentiation:
-        w(f"| {_cell(d.dimension)} | {_cell(d.claimed)} | {_cell(d.observable)} | {d.reproducibility.value} | {_cites(d.evidence_ids)} |")
+        w(f"| {_cell(d.dimension)} | {_cell(d.claimed)} | {_cell(d.observable)} | {t('repro.' + d.reproducibility.value)} | {_cites(d.evidence_ids)} |")
     w("")
 
-    w("## 13. Customers, Partnerships and Ecosystem\n")
-    w(_paras(n.customers_partnerships_ecosystem) + "\n")
-    w("**Named customers and case studies**\n\n" + _claims(signals.named_customers, "No named customers found.") + "\n")
-    w("**Partnerships and integrations**\n\n" + _claims(signals.partnerships_and_integrations, "No partnerships or integrations found.") + "\n")
-    w("**Geography**\n\n" + _claims(signals.geography) + "\n")
+    section(13, n.customers_partnerships_ecosystem)
+    sub("named_customers", claims(signals.named_customers, "no_customers"))
+    sub("partnerships", claims(signals.partnerships_and_integrations, "no_partnerships"))
+    sub("geography", claims(signals.geography))
 
-    w("## 14. Financial and Funding Information\n")
-    w(_paras(n.financial_and_funding) + "\n")
-    w(_claims(a.financials, "No financial or funding information is publicly available; nothing is estimated here.") + "\n")
+    section(14, n.financial_and_funding)
+    w(claims(a.financials, "no_financials") + "\n")
 
-    w("## 15. Growth and Traction Signals\n")
-    w(_paras(n.growth_and_traction) + "\n")
-    w("**Commercial signals**\n\n" + _claims(a.commercial_signals) + "\n")
-    w("**Organization and talent**\n\n" + _claims(a.organization) + "\n")
-    w("**Hiring signals from the careers pages**\n\n" + _claims(signals.careers_signals, "No careers page content found.") + "\n")
+    section(15, n.growth_and_traction)
+    sub("commercial_signals", claims(a.commercial_signals))
+    sub("organization", claims(a.organization))
+    sub("hiring", claims(signals.careers_signals, "no_careers"))
 
-    w("## 16. SWOT\n")
-    for title, items in (("Strengths", a.swot.strengths), ("Weaknesses", a.swot.weaknesses),
-                         ("Opportunities", a.swot.opportunities), ("Threats", a.swot.threats)):
-        w(f"### {title}\n\n" + _claims(items) + "\n")
+    section(16)
+    for key, items in (("strengths", a.swot.strengths), ("weaknesses", a.swot.weaknesses),
+                       ("opportunities", a.swot.opportunities), ("threats", a.swot.threats)):
+        w(f"### {t(key)}\n\n" + claims(items) + "\n")
 
-    w("### Strategic analysis\n")
+    w(f"### {t('strategic_analysis')}\n")
     for s in a.strategic:
-        w(f"**{s.question}**\n\n{s.answer} {_cites(s.evidence_ids)}\n".replace(" \n", "\n"))
+        w(f"**{t.question(s.question)}**\n\n{s.answer} {_cites(s.evidence_ids)}\n".replace(" \n", "\n"))
 
-    w("### Business maturity\n")
-    w("| Dimension | Evidence |\n|---|---|")
+    w(f"### {t('business_maturity')}\n")
+    w(_head(t("dimension"), t("evidence")))
     for r in a.maturity:
-        w(f"| {r.dimension} | {_cell(r.evidence)} {_cites(r.evidence_ids)} |")
+        w(f"| {t.dimension(r.dimension)} | {_cell(r.evidence)} {_cites(r.evidence_ids)} |")
     w("")
 
-    w("## 17. Risks and Red Flags\n")
-    w(_paras(n.risks_and_red_flags) + "\n")
-    w(_claims(a.red_flags, "No red flags were identified in the evidence gathered; absence of evidence is not evidence of absence.") + "\n")
+    section(17, n.risks_and_red_flags)
+    w(claims(a.red_flags, "no_red_flags") + "\n")
 
-    w("## 18. Strategic Opportunities\n")
-    w(_paras(n.strategic_opportunities) + "\n")
-    w("| Type | Opportunity | Why it exists | Evidence |\n|---|---|---|---|")
+    section(18, n.strategic_opportunities)
+    w(_head(t("type"), t("opportunity"), t("why_exists"), t("evidence")))
     for o in a.opportunities:
         w(f"| {_cell(o.kind)} | {_cell(o.description)} | {_cell(o.rationale)} | {_cites(o.evidence_ids)} |")
     w("")
 
-    w("## 19. Analyst Observations\n")
-    w(_paras(n.analyst_observations) + "\n")
-    w(_claims(a.analyst_observations) + "\n")
+    section(19, n.analyst_observations)
+    w(claims(a.analyst_observations) + "\n")
 
-    w("## 20. Open Questions\n")
-    questions = list(a.open_questions) + [f"Research gap: {x}" for x in findings.not_found]
-    w("\n".join(f"- {q}" for q in questions) if questions else "_None._")
+    section(20)
+    questions = list(a.open_questions) + [t("research_gap", gap=x) for x in findings.not_found]
+    w("\n".join(f"- {q}" for q in questions) if questions else f"_{t('none')}_")
     w("")
 
-    w("## 21. Sources\n")
+    section(21)
     body = "\n".join(out)
     used = _cited_ids(body)
-    w("| Id | Title | Publisher | URL | Published | Type | Accessed |\n|---|---|---|---|---|---|---|")
+    w(_head(t("id"), t("title_col"), t("publisher"), t("url"), t("published"), t("type"), t("accessed")))
     for e in ledger:
         if e.id in used:
-            w(f"| {e.id} | {_cell(e.title)} | {_cell(e.publisher)} | {e.url} | {e.published or 'n/a'} | "
-              f"{e.source_type.value.replace('_', ' ')} | {access_date} |")
+            w(f"| {e.id} | {_cell(e.title)} | {_cell(e.publisher)} | {e.url} | {e.published or t('n_a')} | "
+              f"{t(e.source_type.value)} | {access_date} |")
     if findings.rejected:
-        w("\n**Discarded during verification** (sources the research model cited that were never returned by search):\n")
+        w(f"\n{t('discarded')}\n")
         for r in findings.rejected:
             w(f"- {r}")
     w("")

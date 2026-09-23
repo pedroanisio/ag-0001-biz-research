@@ -125,11 +125,11 @@ class EvidenceLedger:
         )
 
     def save(self, path: Path) -> None:
-        path.write_text(json.dumps([e.model_dump(mode="json") for e in self], indent=2))
+        path.write_text(json.dumps([e.model_dump(mode="json") for e in self], indent=2, ensure_ascii=False), encoding="utf-8")
 
     @classmethod
     def load(cls, path: Path) -> "EvidenceLedger":
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, list):
             raise ValueError("evidence file must contain a list")
         return cls([Evidence.model_validate(x) for x in raw])
