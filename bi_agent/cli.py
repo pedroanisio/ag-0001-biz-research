@@ -5,6 +5,7 @@
     bi-agent identify --out runs/example
     bi-agent signals --out runs/example
     bi-agent research --out runs/example
+    bi-agent resolve --out runs/example
     bi-agent analyze --out runs/example
     bi-agent narrate --out runs/example
     bi-agent report --out runs/example
@@ -28,7 +29,7 @@ from .errors import BiAgentError
 from .i18n import SUPPORTED
 from .llm import DEFAULT_MODEL, LLM, build_client
 
-STAGES_NEEDING_LLM = {"identify", "signals", "research", "analyze", "narrate", "run"}
+STAGES_NEEDING_LLM = {"identify", "signals", "research", "resolve", "analyze", "narrate", "run"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("run", "crawl"):
         s = sub.add_parser(name)
         s.add_argument("--url", required=True)
-    for name in ("identify", "signals", "research", "analyze", "narrate", "report"):
+    for name in ("identify", "signals", "research", "resolve", "analyze", "narrate", "report"):
         sub.add_parser(name)
     return p
 
@@ -103,6 +104,9 @@ def main(
         elif args.stage == "research":
             res = pipeline.stage_research(store, llm)
             print(f"research: {len(res.findings)} findings, {len(res.rejected)} rejected")
+        elif args.stage == "resolve":
+            ident = pipeline.stage_resolve(store, llm)
+            print(f"identity: {ident.company_name.value or 'unknown'} (legal name: {ident.legal_name.value or 'unknown'})")
         elif args.stage == "analyze":
             pipeline.stage_analyze(store, llm)
             print("analysis written")

@@ -130,6 +130,9 @@ def _run_to(store, http_client, stage: str, client=None) -> LLM:
     pipeline.stage_research(store, llm, groups=GROUPS)
     if stage == "research":
         return llm
+    pipeline.stage_resolve(store, llm)
+    if stage == "resolve":
+        return llm
     pipeline.stage_analyze(store, llm)
     if stage == "analyze":
         return llm
@@ -219,6 +222,33 @@ def test_research_fails_when_every_group_fails(store, http_client):
     llm = _run_to(store, http_client, "signals", stage_router({"submit_findings": down}))
     with pytest.raises(StageError, match="every topic group"):
         pipeline.stage_research(store, llm, groups=GROUPS)
+
+
+def test_resolve_refines_identity_with_external_evidence(store, http_client):
+    from tests.conftest import identity_payload
+
+    def resolved(kw):
+        p = identity_payload()
+        if "EXTERNAL FINDINGS" in kw["messages"][0]["content"]:  # the resolve call, not identify
+            assert "Acme raised a Series A" in kw["messages"][0]["content"]
+            p["legal_name"] = {"value": "Acme Widgets Ltda", "classification": "verified_fact",
+                               "evidence_ids": [third_party_id(kw)]}
+        return response(tool_use("submit_identity", p))
+
+    llm = _run_to(store, http_client, "resolve", stage_router({"submit_identity": resolved}))
+    site = store.load_model("identity.site.json", Identity)
+    final = store.load_model("identity.json", Identity)
+    assert site.legal_name.value is None or site.legal_name.value != "Acme Widgets Ltda"
+    assert final.legal_name.value == "Acme Widgets Ltda"
+    assert final.legal_name.classification is Classification.VERIFIED_FACT
+    assert "resolve" in store.load_json("usage.json")["stages"]
+    pipeline.stage_analyze(store, llm)
+    pipeline.stage_narrate(store, llm)
+    assert "| Legal entity | Acme Widgets Ltda *(Verified fact)*" in pipeline.stage_report(store)
+    # re-running starts again from the website identity, and old runs without identity.site.json still work
+    store.path("identity.site.json").unlink()
+    pipeline.stage_resolve(store, llm)
+    assert store.exists("identity.site.json")
 
 
 def test_analyze_and_narrate_then_report(store, http_client):
@@ -322,7 +352,7 @@ def test_cli_run_and_stage_by_stage(tmp_path, http_client, monkeypatch, capsys):
     common = ["--out", out, "--max-pages", "4", "--delay", "0"]
     assert cli.main(common + ["crawl", "--url", SITE], client_factory=factory, http_client=http_client) == 0
     assert "crawled 4 pages" in capsys.readouterr().out
-    for stage in ("identify", "signals", "research", "analyze", "narrate", "report"):
+    for stage in ("identify", "signals", "research", "resolve", "analyze", "narrate", "report"):
         assert cli.main(common + [stage], client_factory=factory, http_client=http_client) == 0, stage
     assert "report written" in capsys.readouterr().out
     assert (tmp_path / "r" / "report.md").exists()

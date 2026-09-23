@@ -6,7 +6,8 @@ Run directory layout::
     run.json        start url, timestamps, site language and report language
     pages.json      crawled pages
     evidence.json   evidence ledger (first- and third-party)
-    identity.json   Identity
+    identity.site.json  Identity from the website alone (identify)
+    identity.json   Identity: the website identity, refined by external research once resolve runs
     signals.json    SiteSignals
     findings.json   ExternalFindings
     analysis.json   Analysis
@@ -239,6 +240,7 @@ def stage_identify(store: RunStore, llm: LLM) -> Identity:
             shared_tools=SITE_TOOLS, repair=lambda p: repair_refs(p, ledger),
             semantic_check=lambda o: semantic_errors(o, ledger),
         )
+    store.save_model("identity.site.json", identity)
     store.save_model("identity.json", identity)
     return identity
 
@@ -377,6 +379,45 @@ def stage_research(
     return result
 
 
+# --------------------------------------------------------------------------- stage: resolve
+
+IDENTITY_TOPICS = {"corporate", "funding", "leadership", "financials", "regulatory", "news"}
+
+
+def stage_resolve(store: RunStore, llm: LLM) -> Identity:
+    """Refine the website identity with what external research found (registries, filings, press).
+
+    Always starts from identity.site.json, so running it again gives the same starting point; runs
+    made before this stage existed fall back to identity.json.
+    """
+    ledger = store.ledger()
+    site_file = "identity.site.json" if store.exists("identity.site.json") else "identity.json"
+    site = store.load_model(site_file, Identity)
+    if site_file == "identity.json":
+        store.save_model("identity.site.json", site)
+    findings = store.load_model("findings.json", ExternalFindings)
+    relevant = [f for f in findings.findings if f.topic.value in IDENTITY_TOPICS]
+    cited = {i for f in relevant for i in f.evidence_ids}
+    cited |= {i for attr in site.model_dump().values() if isinstance(attr, dict) for i in attr.get("evidence_ids", [])}
+    index = "\n".join(line for line, e in zip(ledger.index_text().splitlines(), ledger) if e.id in cited)
+    user = (
+        "EVIDENCE (ids you may cite):\n" + index
+        + "\n\nIDENTITY FROM THE WEBSITE:\n" + pretty(site)
+        + "\n\nEXTERNAL FINDINGS:\n" + json.dumps([f.model_dump(mode="json") for f in relevant],
+                                                   separators=(",", ":"), ensure_ascii=False)
+    )
+    with metered(store, llm, "resolve"):
+        identity = llm.structured(
+            system=prompts.localized(prompts.RESOLVE_SYSTEM, store.lang()), user=user, schema=Identity,
+            tool_name="submit_identity", repair=lambda p: repair_refs(p, ledger),
+            semantic_check=lambda o: semantic_errors(o, ledger),
+        )
+    store.save_model("identity.json", identity)
+    changed = [k for k in Identity.model_fields if getattr(site, k) != getattr(identity, k)]
+    log.info("identity resolved with external research; changed: %s", ", ".join(changed) or "nothing")
+    return identity
+
+
 # --------------------------------------------------------------------------- stage: analyze
 
 
@@ -450,6 +491,7 @@ def run_all(store: RunStore, url: str, crawler: Crawler, llm: LLM, lang: str | N
     stage_identify(store, llm)
     stage_signals(store, llm)
     stage_research(store, llm)
+    stage_resolve(store, llm)
     stage_analyze(store, llm)
     stage_narrate(store, llm)
     return stage_report(store)

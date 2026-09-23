@@ -17,13 +17,14 @@ Python 3.10+. Off-site research uses Anthropic's server-side `web_search` tool, 
 bi-agent --out runs/acme run --url https://acme.example
 ```
 
-The fleet is seven scripts sharing one run directory, so every stage can be run, inspected and re-run on its own:
+The fleet is eight scripts sharing one run directory, so every stage can be run, inspected and re-run on its own:
 
 ```
 bi-agent --out runs/acme crawl --url https://acme.example   # pages.json, evidence.json, run.json
-bi-agent --out runs/acme identify                            # identity.json
+bi-agent --out runs/acme identify                            # identity.site.json (website only)
 bi-agent --out runs/acme signals                             # signals.json
 bi-agent --out runs/acme research                            # findings.json, extends evidence.json (resumable)
+bi-agent --out runs/acme resolve                             # identity.json: website identity refined by research
 bi-agent --out runs/acme analyze                             # analysis.json
 bi-agent --out runs/acme narrate                             # narrative.json
 bi-agent --out runs/acme report                              # report.md
@@ -67,7 +68,7 @@ bi_agent/cli.py       subcommands
 
 ## Cost and size
 
-One full run is 4 structured calls (plus any validation retries) and 5 research calls with up to 10 searches each, so at most 50 searches. Page text sent to the model is capped at 260k characters (6k per page).
+One full run is 5 structured calls (plus any validation retries) and 5 research calls with up to 10 searches each, so at most 50 searches. Page text sent to the model is capped at 260k characters (6k per page).
 
 What keeps the bill down:
 

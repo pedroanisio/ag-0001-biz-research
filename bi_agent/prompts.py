@@ -37,6 +37,22 @@ where you are reading between the lines) and cite the page ids [E###].
 Give every offering a kind: core_product, secondary_product, service, professional_services, subscription,
 platform, api, software, hardware, data_product, marketplace, licensing or other."""
 
+RESOLVE_SYSTEM = ANALYST_ROLE + """
+
+Task: produce the final identity of the company. You are given the identity established from the
+website alone and the external findings on corporate, funding, leadership, financial, regulatory and
+news topics. For every attribute:
+- prefer primary external evidence (registries, filings, regulators, investor disclosures) over the
+  website, and independent reporting over the company's own statements;
+- keep a website-established value unless external evidence corrects or refines it (for example the
+  registered legal name, the actual parent company or majority owner, the founding year on record);
+- keep the evidence ids that support the value you keep, from the website and from the findings;
+- when sources disagree, keep the best-supported value and record the disagreement, naming both
+  sources, in identity_uncertainties; keep the website's uncertainties that the findings did not settle;
+- an attribute no source establishes stays null and unknown.
+Classify by the evidence: a value confirmed by an independent source is verified_fact; one only the
+company states is company_claim."""
+
 RESEARCH_SYSTEM = ANALYST_ROLE + """
 
 Task: research the company beyond its own website using web_search. Prioritise primary and credible
