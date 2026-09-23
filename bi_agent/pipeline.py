@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,8 +45,11 @@ from .models import (
     Narrative,
     RawFindings,
     SiteSignals,
+    SourceKind,
     SourceType,
     check_refs,
+    plausible_source_kind,
+    supported_classification,
     normalize_url,
     repair_refs,
     semantic_errors,
@@ -57,6 +61,9 @@ T = TypeVar("T", bound=BaseModel)
 
 PAGE_CHARS_FOR_LLM = 6_000
 TOTAL_CHARS_FOR_LLM = 260_000
+# A site below either threshold gives the analysis little to work with, so research is expanded.
+THIN_SITE_CHARS = 20_000
+THIN_SITE_PAGES = 5
 IDENTIFY_CHARS_FOR_LLM = 120_000  # identify reads the highest-priority pages only
 
 
@@ -158,9 +165,20 @@ def stage_crawl(store: RunStore, url: str, crawler: Crawler, lang: str | None = 
             source_type=SourceType.FIRST_PARTY, url=p.url, title=p.title or p.url,
             publisher=urlparse(p.url).hostname or "company website",
             excerpt=(p.description + "\n" + p.text)[:1500], retrieved_at=p.fetched_at,
+            source_kind=SourceKind.OFFICIAL_COMPANY,
         )
+    site_chars = sum(len(p.text) for p in pages)
+    js_pages = sum(1 for p in pages if p.js_rendered)
+    thin = site_chars < THIN_SITE_CHARS or len(pages) < THIN_SITE_PAGES
     store.save_json("run.json", {"url": url, "start": pages[0].url if pages else url, "started_at": now_iso(),
-                                 "pages": len(pages), "site_lang": site_lang, "lang": None})
+                                 "pages": len(pages), "site_lang": site_lang, "lang": None,
+                                 "site_chars": site_chars, "js_rendered_pages": js_pages, "thin_site": thin})
+    if js_pages:
+        log.warning("%d of %d pages look JavaScript-rendered (almost no text without running scripts); the "
+                    "crawler does not run JavaScript, so their content is missing", js_pages, len(pages))
+    if thin:
+        log.warning("the website yielded little text (%d characters from %d pages); external research will be "
+                    "expanded", site_chars, len(pages))
     if lang:
         store.set_lang(lang)
     store.save_json("pages.json", [p.to_dict() for p in pages])
@@ -274,9 +292,11 @@ def verify_findings(
 ) -> tuple[list[Finding], list[str]]:
     """Convert raw findings into ledger-backed findings.
 
-    A source is accepted only if its URL was returned by web_search in this run or belongs to the
-    company's own site. Findings left with no accepted source are rejected (returned as messages),
-    except ``unknown`` findings, which need no source.
+    A source is accepted only if its URL was returned by web_search or web_fetch in this run or
+    belongs to the company's own site. Findings left with no accepted source are rejected (returned
+    as messages), except ``unknown`` findings, which need no source. Classifications are lowered to
+    what the sources support (:func:`models.supported_classification`): a verified fact needs a
+    primary record or two independent sources.
     """
     hit_urls = {normalize_url(h.url): h for h in hits}
     accepted: list[Finding] = []
@@ -289,42 +309,94 @@ def verify_findings(
             if key not in hit_urls and not on_site:
                 rejected.append(f"[{f.topic.value}] dropped source not returned by search: {s.url}")
                 continue
+            kind = plausible_source_kind(s.source_kind, s.url, on_site)
+            if kind is not s.source_kind:
+                log.info("source kind of %s lowered from %s to %s", s.url, s.source_kind.value, kind.value)
             ev = ledger.add(
                 source_type=SourceType.FIRST_PARTY if on_site else SourceType.THIRD_PARTY,
                 url=s.url, title=s.title or (hit_urls[key].title if key in hit_urls else s.url),
                 publisher=s.publisher or (urlparse(s.url).hostname or "unknown"),
-                excerpt=s.excerpt, published=s.published, retrieved_at=retrieved_at,
+                excerpt=s.excerpt, published=s.published, retrieved_at=retrieved_at, source_kind=kind,
             )
+            if ev.source_kind is None:  # an item saved before source kinds existed
+                ev.source_kind = kind
             if ev.id not in ids:
                 ids.append(ev.id)
         cls = f.classification
         if not ids and cls != Classification.UNKNOWN:
             rejected.append(f"[{f.topic.value}] dropped finding with no verifiable source: {f.statement[:120]}")
             continue
-        kinds = {ledger.get(i).source_type for i in ids}
-        if cls == Classification.VERIFIED_FACT and SourceType.THIRD_PARTY not in kinds:
-            cls = Classification.COMPANY_CLAIM  # only the company says so
-        if cls == Classification.THIRD_PARTY_CLAIM and SourceType.THIRD_PARTY not in kinds:
-            cls = Classification.COMPANY_CLAIM
-        if cls == Classification.COMPANY_CLAIM and SourceType.FIRST_PARTY not in kinds:
-            cls = Classification.THIRD_PARTY_CLAIM
+        if ids:
+            cls = Classification(supported_classification(cls.value, [ledger.get(i) for i in ids]))
         accepted.append(Finding(topic=f.topic, statement=f.statement, classification=cls, evidence_ids=ids))
     return accepted, rejected
 
 
 RESEARCH_PROGRESS = "research.partial.json"
+FOLLOWUP_ROUNDS = 2
+MIN_NEW_FINDINGS = 3  # a follow-up round adding fewer new findings than this ends the research
+THIN_SITE_SEARCH_FACTOR = 1.5
+
+
+def _statement_key(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _research_call(
+    store: RunStore, llm: LLM, progress: dict, name: str, system: str, user: str, ledger: EvidenceLedger,
+    site_host: str, max_searches: int, label: str = "",
+) -> int | None:
+    """Run one research call and fold it into ``progress``; returns the number of new findings,
+    or None when the call failed transiently. Permanent API errors propagate. ``label`` says where
+    the call sits in the stage and what it covers."""
+    label = label or name
+    log.info("research %s: searching (up to %d web searches) ...", label, max_searches)
+    start = time.monotonic()
+    try:
+        raw, hits = llm.researched(system=system, user=user, schema=RawFindings, max_search_uses=max_searches)
+    except Exception as exc:  # noqa: BLE001 - classified below
+        if not is_transient(exc):
+            raise
+        log.warning("research %s: failed after %s, continuing: %s", label, _elapsed(start), exc)
+        progress["failed"].append(name)
+        progress["not_found"].append(f"{name}: research call failed ({type(exc).__name__})")
+        return None
+    acc, rej = verify_findings(raw, hits, ledger, site_host, now_iso())
+    if name in progress["failed"]:  # an earlier attempt failed; this one succeeded
+        progress["failed"].remove(name)
+        progress["not_found"] = [x for x in progress["not_found"] if not x.startswith(f"{name}: research call failed")]
+    seen = {_statement_key(f["statement"]) for f in progress["findings"]}
+    new = [f for f in acc if _statement_key(f.statement) not in seen]
+    progress["findings"].extend(f.model_dump(mode="json") for f in new)
+    progress["rejected"].extend(rej)
+    progress["not_found"].extend(f"{name}: {x}" for x in raw.not_found)
+    progress["done"].append(name)
+    store.save_ledger(ledger)
+    store.save_json(RESEARCH_PROGRESS, progress)
+    log.info("research %s: %d new findings, %d rejected (%s; %d findings in total)",
+             label, len(new), len(rej), _elapsed(start), len(progress["findings"]))
+    return len(new)
 
 
 def stage_research(
-    store: RunStore, llm: LLM, groups: dict[str, dict[str, str]] | None = None
+    store: RunStore, llm: LLM, groups: dict[str, dict[str, str]] | None = None,
+    followup_rounds: int = FOLLOWUP_ROUNDS,
 ) -> ExternalFindings:
-    """Research each topic group with web_search, checkpointing after every group.
+    """Research the company beyond its website, then follow the leads that research surfaces.
 
-    A group that fails with a transient error (rate limit, server error, network, invalid output)
-    is recorded in not_found and the next group runs. Any other API error (no credit, bad key,
-    unknown model) stops the stage at once: every later call would fail the same way. Progress is
-    saved after each group, so re-running the stage resumes where it stopped instead of paying for
-    finished groups again.
+    1. One call per topic group (web_search plus web_fetch for reading a filing or report in full).
+    2. Up to ``followup_rounds`` follow-up calls. Each is given what is known so far and investigates
+       the entities discovered (parent, investors, founders, key competitors), contradictions,
+       single-source claims and gaps. The rounds stop early once one adds fewer than
+       MIN_NEW_FINDINGS new findings, the point of diminishing returns.
+
+    When the website yielded little text (thin or JavaScript-rendered), every call gets more
+    searches and one more follow-up round is allowed.
+
+    A call that fails with a transient error (rate limit, server error, network, invalid output) is
+    recorded in not_found and research continues. Any other API error (no credit, bad key, unknown
+    model) stops the stage at once: every later call would fail the same way. Progress is saved
+    after each call, so re-running the stage resumes where it stopped.
     """
     ledger = store.ledger()
     identity = store.load_model("identity.json", Identity)
@@ -332,43 +404,56 @@ def stage_research(
     meta = store.meta()
     site_host = registrable_host(urlparse(canonical(meta["start"])).hostname or "")
     company = identity.company_name.value or site_host
+    other_names = [v for v in (identity.legal_name.value, identity.brands.value, identity.parent_company.value)
+                   if v and v != company]
     known_lines = [f"- offering: {o.name}: {o.problem_solved}" for o in signals.offerings[:8]]
     known_lines += [f"- segment: {c.statement}" for c in signals.customer_segments[:5]]
     if identity.headquarters.value:
         known_lines.append(f"- headquarters: {identity.headquarters.value}")
+    if identity.website_subject.value:
+        known_lines.append(f"- the website represents: {identity.website_subject.value}")
     known = "\n".join(known_lines) or "- nothing extracted from the website"
     groups = groups or prompts.research_groups()
+    thin = bool(meta.get("thin_site"))
+    searches = round(llm.max_search_uses * THIN_SITE_SEARCH_FACTOR) if thin else llm.max_search_uses
+    rounds = followup_rounds + 1 if thin else followup_rounds
 
     progress = store.load_json(RESEARCH_PROGRESS) if store.exists(RESEARCH_PROGRESS) else {
-        "done": [], "failed": [], "findings": [], "not_found": [], "rejected": []}
+        "done": [], "failed": [], "findings": [], "not_found": [], "rejected": [], "stopped": False}
+    progress.setdefault("stopped", False)
     if progress["done"]:
         log.info("resuming research: %s already done", ", ".join(progress["done"]))
     system = prompts.localized(prompts.RESEARCH_SYSTEM, store.lang())
+    total = len(groups) + rounds
+    log.info("research plan: %d topic groups (%s), then up to %d follow-up rounds; at most %d calls",
+             len(groups), ", ".join(groups), rounds, total)
     with metered(store, llm, "research"):
-        for group, topics in groups.items():
+        for i, (group, topics) in enumerate(groups.items(), 1):
             if group in progress["done"]:
                 continue
             user = prompts.research_user_prompt(
-                company, meta["start"], topics, known, store.site_lang(), llm.max_search_uses)
-            try:
-                raw, hits = llm.researched(system=system, user=user, schema=RawFindings)
-            except Exception as exc:  # noqa: BLE001 - classified below
-                if not is_transient(exc):
-                    raise
-                log.warning("research group %s failed: %s", group, exc)
-                progress["failed"].append(group)
-                progress["not_found"].append(f"{group}: research call failed ({type(exc).__name__})")
+                company, meta["start"], topics, known, store.site_lang(), searches,
+                other_names=other_names, thin_site=thin)
+            label = f"{i}/{total} {group} ({', '.join(topics)})"
+            _research_call(store, llm, progress, group, system, user, ledger, site_host, searches, label)
+        if not any(g in progress["done"] for g in groups):
+            raise StageError("research failed for every topic group; nothing to analyze (re-run the research stage)")
+        for r in range(1, rounds + 1):
+            name = f"followup-{r}"
+            if progress["stopped"]:
+                break
+            if name in progress["done"]:
                 continue
-            acc, rej = verify_findings(raw, hits, ledger, site_host, now_iso())
-            progress["findings"].extend(f.model_dump(mode="json") for f in acc)
-            progress["rejected"].extend(rej)
-            progress["not_found"].extend(f"{group}: {x}" for x in raw.not_found)
-            progress["done"].append(group)
-            store.save_ledger(ledger)
-            store.save_json(RESEARCH_PROGRESS, progress)
-            log.info("group %s (%s): %d findings accepted, %d rejected", group, ", ".join(topics), len(acc), len(rej))
-    if not any(g in progress["done"] for g in groups):
-        raise StageError("research failed for every topic group; nothing to analyze (re-run the research stage)")
+            user = prompts.followup_user_prompt(
+                company, meta["start"], progress["findings"], progress["not_found"], known, store.site_lang(),
+                searches, other_names=other_names)
+            label = f"{len(groups) + r}/{total} {name} (following leads, gaps and contradictions)"
+            new = _research_call(store, llm, progress, name, system, user, ledger, site_host, searches, label)
+            if new is not None and new < MIN_NEW_FINDINGS:
+                progress["stopped"] = True
+                store.save_json(RESEARCH_PROGRESS, progress)
+                log.info("research stopped after %s: only %d new findings (diminishing returns); "
+                         "skipping the remaining follow-up rounds", name, new)
     result = ExternalFindings(
         findings=[Finding.model_validate(f) for f in progress["findings"]],
         not_found=progress["not_found"], rejected=progress["rejected"],
@@ -486,12 +571,60 @@ def stage_report(store: RunStore) -> str:
     return md
 
 
-def run_all(store: RunStore, url: str, crawler: Crawler, llm: LLM, lang: str | None = None) -> str:
-    stage_crawl(store, url, crawler, lang)
-    stage_identify(store, llm)
-    stage_signals(store, llm)
-    stage_research(store, llm)
-    stage_resolve(store, llm)
-    stage_analyze(store, llm)
-    stage_narrate(store, llm)
-    return stage_report(store)
+# (name, what it does) in run order; run_all numbers them so the log shows where the run is.
+STAGES: list[tuple[str, str]] = [
+    ("crawl", "crawling the website"),
+    ("identify", "identifying the company from the website"),
+    ("signals", "extracting offerings and customer segments"),
+    ("research", "researching beyond the website (web search)"),
+    ("resolve", "refining the identity with external evidence"),
+    ("analyze", "analyzing"),
+    ("narrate", "writing the narrative"),
+    ("report", "rendering the report"),
+]
+
+
+def _elapsed(start: float) -> str:
+    seconds = round(time.monotonic() - start)
+    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+@contextmanager
+def announced(store: RunStore, name: str) -> Iterator[None]:
+    """Log the start and end of one stage of ``run_all``: its position, elapsed time, cost so far."""
+    index = next(i for i, (n, _) in enumerate(STAGES, 1) if n == name)
+    tag = f"[{index}/{len(STAGES)}] {name}"
+    log.info("%s: %s ...", tag, dict(STAGES)[name])
+    start = time.monotonic()
+    try:
+        yield
+    except BaseException:
+        log.error("%s: failed after %s", tag, _elapsed(start))
+        raise
+    cost = store.load_json("usage.json").get("total", {}).get("estimated_cost_usd") \
+        if store.exists("usage.json") else None
+    later = [n for n, _ in STAGES[index:]]
+    log.info("%s: done in %s%s; %s", tag, _elapsed(start),
+             f", run cost so far ~${cost:.2f}" if cost is not None else "",
+             f"next: {', '.join(later)}" if later else "all stages done")
+
+
+def run_all(
+    store: RunStore, url: str, crawler: Crawler, llm: LLM, lang: str | None = None,
+    followup_rounds: int = FOLLOWUP_ROUNDS,
+) -> str:
+    steps = {
+        "crawl": lambda: stage_crawl(store, url, crawler, lang),
+        "identify": lambda: stage_identify(store, llm),
+        "signals": lambda: stage_signals(store, llm),
+        "research": lambda: stage_research(store, llm, followup_rounds=followup_rounds),
+        "resolve": lambda: stage_resolve(store, llm),
+        "analyze": lambda: stage_analyze(store, llm),
+        "narrate": lambda: stage_narrate(store, llm),
+        "report": lambda: stage_report(store),
+    }
+    md = ""
+    for name, _ in STAGES:
+        with announced(store, name):
+            md = steps[name]()
+    return md

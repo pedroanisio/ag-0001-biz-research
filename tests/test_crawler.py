@@ -139,3 +139,12 @@ def test_page_round_trip(http_client):
     from bi_agent.crawler import Page
 
     assert Page.from_dict(page.to_dict()) == page
+
+
+def test_extract_flags_javascript_app_shells():
+    shell = extract("https://a.test/", "<html><body><div id='root'></div><script src='a.js'></script></body></html>")
+    assert shell.js_rendered
+    many_scripts = extract("https://a.test/", "<html><body>Hi<script>1</script><script>2</script><script>3</script></body></html>")
+    assert many_scripts.js_rendered
+    rendered = extract("https://a.test/", "<html><body><div id='root'>" + "Real content. " * 40 + "</div><script></script></body></html>")
+    assert not rendered.js_rendered

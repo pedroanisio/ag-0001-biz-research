@@ -52,6 +52,10 @@ def search_tool_type(model: str) -> str:
     return "web_search_20250305" if _BASIC_SEARCH_MODELS.search(model) else "web_search_20260209"
 
 
+def fetch_tool_type(model: str) -> str:
+    return "web_fetch_20250910" if _BASIC_SEARCH_MODELS.search(model) else "web_fetch_20260209"
+
+
 @dataclass
 class Usage:
     """Token and search counts for one API call."""
@@ -146,6 +150,8 @@ class LLM:
         max_tokens: int = 64_000,
         max_attempts: int = 3,
         max_search_uses: int = 10,
+        max_fetch_uses: int = 3,
+        max_fetch_tokens: int = 20_000,
         max_research_turns: int = 4,
         thinking: dict | None = None,
     ) -> None:
@@ -156,6 +162,8 @@ class LLM:
         self.max_tokens = max_tokens
         self.max_attempts = max_attempts
         self.max_search_uses = max_search_uses
+        self.max_fetch_uses = max_fetch_uses
+        self.max_fetch_tokens = max_fetch_tokens
         self.max_research_turns = max_research_turns
         # Thinking is off by default: the output is a forced tool call validated in code, and the
         # previous default model ran without thinking. Pass {"type": "adaptive"} to turn it on.
@@ -200,8 +208,16 @@ class LLM:
 
     @staticmethod
     def _collect_hits(response: Any) -> list[SearchHit]:
+        """URLs the server tools actually retrieved: search results and successfully fetched pages."""
         hits: list[SearchHit] = []
         for block in _attr(response, "content", []) or []:
+            if _attr(block, "type") == "web_fetch_tool_result":
+                result = _attr(block, "content")
+                if _attr(result, "type") == "web_fetch_result" and _attr(result, "url"):
+                    doc = _attr(result, "content")
+                    hits.append(SearchHit(url=_attr(result, "url"), title=_attr(doc, "title", "") or "",
+                                          page_age=_attr(result, "retrieved_at")))
+                continue  # anything else is an error object (url_not_accessible, too many uses ...)
             if _attr(block, "type") != "web_search_tool_result":
                 continue
             content = _attr(block, "content", [])
@@ -263,8 +279,11 @@ class LLM:
             payload = _attr(block, "input")
             if repair is not None:
                 payload, notes = repair(payload)
+                if notes:
+                    log.info("%s: %d mechanical fixes applied without another model call (-v lists them)",
+                             tool_name, len(notes))
                 for note in notes:
-                    log.warning("%s: repaired %s", tool_name, note)
+                    log.debug("%s: repaired %s", tool_name, note)
             obj, last_errors = self._parse(schema, payload, semantic_check)
             if obj is not None:
                 return obj
@@ -288,19 +307,30 @@ class LLM:
         user: str,
         schema: type[T],
         tool_name: str = "submit_findings",
-        tool_description: str = "Submit findings with the exact source URLs returned by web_search.",
+        tool_description: str = "Submit findings with the exact source URLs returned by web_search or web_fetch.",
         allowed_domains: list[str] | None = None,
+        max_search_uses: int | None = None,
     ) -> tuple[T, list[SearchHit]]:
         submit = self._tool(tool_name, schema, tool_description)
-        search: dict = {"type": search_tool_type(self.model), "name": "web_search", "max_uses": self.max_search_uses}
+        search: dict = {"type": search_tool_type(self.model), "name": "web_search",
+                        "max_uses": max_search_uses or self.max_search_uses}
         if allowed_domains:
             search["allowed_domains"] = allowed_domains
+        tools: list[dict] = [search]
+        if self.max_fetch_uses:
+            # web_fetch reads a page the search surfaced (a filing, an annual report) in full.
+            fetch: dict = {"type": fetch_tool_type(self.model), "name": "web_fetch",
+                           "max_uses": self.max_fetch_uses, "max_content_tokens": self.max_fetch_tokens}
+            if allowed_domains:
+                fetch["allowed_domains"] = allowed_domains
+            tools.append(fetch)
+        tools.append(submit)
         messages: list[dict] = [{"role": "user", "content": user}]
         hits: list[SearchHit] = []
         last_errors: list[str] = []
         force = False
         for _turn in range(self.max_research_turns):
-            kwargs: dict = dict(system=system, messages=messages, tools=[search, submit])
+            kwargs: dict = dict(system=system, messages=messages, tools=tools)
             if force:
                 kwargs["tool_choice"] = {"type": "tool", "name": tool_name}
             response = self._create(tool_name, **kwargs)

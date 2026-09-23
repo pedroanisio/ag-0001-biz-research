@@ -38,7 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=os.environ.get("BI_AGENT_MODEL", DEFAULT_MODEL))
     p.add_argument("--max-pages", type=int, default=60)
     p.add_argument("--max-tokens", type=int, default=64_000, help="output token limit per model response")
-    p.add_argument("--max-search-uses", type=int, default=10, help="web_search calls per research topic group")
+    p.add_argument("--max-search-uses", type=int, default=10, help="web_search calls per research call")
+    p.add_argument("--max-fetch-uses", type=int, default=3, help="web_fetch calls per research call (0 disables)")
+    p.add_argument("--followup-rounds", type=int, default=pipeline.FOLLOWUP_ROUNDS,
+                   help="follow-up research rounds after the topic groups (stops earlier at diminishing returns)")
     p.add_argument("--delay", type=float, default=0.5, help="seconds between page fetches")
     p.add_argument("--lang", choices=SUPPORTED, default=None,
                    help="report language (default: the website's language, detected at crawl)")
@@ -55,7 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
 def make_llm(args: argparse.Namespace, client_factory: Callable[[], object] = build_client) -> LLM:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise BiAgentError("ANTHROPIC_API_KEY is not set; the LLM stages cannot run")
-    return LLM(client_factory(), model=args.model, max_search_uses=args.max_search_uses, max_tokens=args.max_tokens)
+    return LLM(client_factory(), model=args.model, max_search_uses=args.max_search_uses,
+               max_fetch_uses=args.max_fetch_uses, max_tokens=args.max_tokens)
 
 
 def make_crawler(args: argparse.Namespace, http_client: httpx.Client | None = None) -> Crawler:
@@ -81,15 +85,17 @@ def main(
     http_client: httpx.Client | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    for noisy in ("httpx", "httpcore", "anthropic"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     store = pipeline.RunStore(Path(args.out))
     try:
         llm = make_llm(args, client_factory) if args.stage in STAGES_NEEDING_LLM else None
         if args.lang and args.stage not in ("run", "crawl"):
             store.set_lang(args.lang)
         if args.stage == "run":
-            md = pipeline.run_all(store, args.url, make_crawler(args, http_client), llm, args.lang)
+            md = pipeline.run_all(store, args.url, make_crawler(args, http_client), llm, args.lang,
+                                  followup_rounds=args.followup_rounds)
             print(f"report written to {store.path('report.md')} ({len(md)} chars)")
         elif args.stage == "crawl":
             pages = pipeline.stage_crawl(store, args.url, make_crawler(args, http_client), args.lang)
@@ -102,7 +108,7 @@ def main(
             sig = pipeline.stage_signals(store, llm)
             print(f"site signals: {len(sig.offerings)} offerings")
         elif args.stage == "research":
-            res = pipeline.stage_research(store, llm)
+            res = pipeline.stage_research(store, llm, followup_rounds=args.followup_rounds)
             print(f"research: {len(res.findings)} findings, {len(res.rejected)} rejected")
         elif args.stage == "resolve":
             ident = pipeline.stage_resolve(store, llm)

@@ -179,3 +179,25 @@ def test_is_transient_classifies_errors():
     assert is_transient(anthropic.APIConnectionError(request=req))
     assert is_transient(LLMOutputError("x", []))
     assert not is_transient(RuntimeError("bug"))
+
+
+def test_researched_accepts_fetched_pages_as_hits_and_ignores_fetch_errors():
+    from types import SimpleNamespace
+
+    fetched = SimpleNamespace(type="web_fetch_tool_result", content=SimpleNamespace(
+        type="web_fetch_result", url="https://filings.test/annual.pdf", retrieved_at="2026-09-01",
+        content=SimpleNamespace(type="document", title="Annual report")))
+    failed = SimpleNamespace(type="web_fetch_tool_result", content=SimpleNamespace(
+        type="web_fetch_tool_error", error_code="url_not_accessible"))
+    client = scripted([response(fetched, failed, tool_use("submit_findings", {"name": "a", "count": 1}))])
+    _, hits = LLM(client, model="claude-sonnet-4-5", max_fetch_uses=2).researched(system="s", user="u", schema=Out)
+    assert hits == [SearchHit("https://filings.test/annual.pdf", "Annual report", "2026-09-01")]
+    tools = {t["name"]: t for t in client.messages.calls[0]["tools"]}
+    assert tools["web_fetch"]["type"] == "web_fetch_20250910" and tools["web_fetch"]["max_uses"] == 2
+
+
+def test_researched_without_fetch():
+    client = scripted([response(tool_use("submit_findings", {"name": "a", "count": 1}))])
+    LLM(client, model="m", max_fetch_uses=0).researched(system="s", user="u", schema=Out, max_search_uses=7)
+    tools = client.messages.calls[0]["tools"]
+    assert [t["name"] for t in tools] == ["web_search", "submit_findings"] and tools[0]["max_uses"] == 7

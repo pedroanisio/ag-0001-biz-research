@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from bi_agent.models import (
+    SourceKind,
     Analysis,
     Attr,
     Claim,
@@ -107,11 +108,24 @@ def test_check_classifications_matches_source_type():
     bad_fact = Claim(statement="s", classification="verified_fact", evidence_ids=["E001"])  # first-party only
     bad_company = Claim(statement="s", classification="company_claim", evidence_ids=["E002"])  # third-party only
     bad_third = Claim(statement="s", classification="third_party_claim", evidence_ids=["E001"])
-    ok_fact = Claim(statement="s", classification="verified_fact", evidence_ids=["E001", "E002"])
+    one_source_fact = Claim(statement="s", classification="verified_fact", evidence_ids=["E001", "E002"])
     assert check_classifications(bad_fact, led) and check_classifications(bad_company, led)
     assert check_classifications(bad_third, led)
-    assert check_classifications(ok_fact, led) == []
-    assert semantic_errors(ok_fact, led) == []
+    assert any("two independent" in e for e in check_classifications(one_source_fact, led))
+    led.add(source_type=SourceType.THIRD_PARTY, url="https://other.test/b", title="Other", publisher="Other",
+            excerpt="z", retrieved_at="r", source_kind=SourceKind.NEWS)                      # E003
+    led.add(source_type=SourceType.THIRD_PARTY, url="https://www.gov.br/receita/x", title="Registry",
+            publisher="Receita", excerpt="r", retrieved_at="r", source_kind=SourceKind.GOVERNMENT_REGULATORY)  # E004
+    led.add(source_type=SourceType.THIRD_PARTY, url="https://news.test/other", title="Same host", publisher="News",
+            excerpt="z", retrieved_at="r", source_kind=SourceKind.NEWS)                      # E005
+    led.add(source_type=SourceType.THIRD_PARTY, url="https://forum.test/t", title="Forum", publisher="Forum",
+            excerpt="z", retrieved_at="r", source_kind=SourceKind.FORUM_SOCIAL)              # E006
+    two_sources = Claim(statement="s", classification="verified_fact", evidence_ids=["E002", "E003"])
+    registry = Claim(statement="s", classification="verified_fact", evidence_ids=["E004"])
+    same_domain = Claim(statement="s", classification="verified_fact", evidence_ids=["E002", "E005"])
+    with_forum = Claim(statement="s", classification="verified_fact", evidence_ids=["E002", "E006"])
+    assert check_classifications(two_sources, led) == [] and semantic_errors(registry, led) == []
+    assert check_classifications(same_domain, led) and check_classifications(with_forum, led)
 
 
 def test_analysis_requires_exact_strategic_questions_and_maturity_dimensions():
@@ -158,6 +172,8 @@ def test_repair_refs_drops_unknown_ids_and_lowers_classifications():
                        excerpt="e", retrieved_at="r").id
     third = ledger.add(source_type=SourceType.THIRD_PARTY, url="https://n.test/", title="t", publisher="p",
                        excerpt="e", retrieved_at="r").id
+    registry = ledger.add(source_type=SourceType.THIRD_PARTY, url="https://www.infogreffe.fr/x", title="t",
+                          publisher="p", excerpt="e", retrieved_at="r", source_kind=SourceKind.GOVERNMENT_REGULATORY).id
     payload = {
         "a": {"classification": "verified_fact", "evidence_ids": [first, "E999"], "statement": f"x [{first}] [E999]."},
         "b": {"classification": "company_claim", "evidence_ids": [third]},
@@ -165,6 +181,7 @@ def test_repair_refs_drops_unknown_ids_and_lowers_classifications():
         "d": {"classification": "company_claim", "evidence_ids": ["E998"]},
         "e": {"value": None, "classification": "company_claim", "evidence_ids": ["E997"]},
         "f": {"classification": "verified_fact", "evidence_ids": [third]},
+        "h": {"classification": "verified_fact", "evidence_ids": [registry]},
         "g": {"classification": "unknown", "evidence_ids": []},
         "n": 3,
     }
@@ -174,7 +191,8 @@ def test_repair_refs_drops_unknown_ids_and_lowers_classifications():
     assert fixed["c"]["classification"] == "company_claim"
     assert fixed["d"] == {"classification": "analytical_inference", "evidence_ids": []}
     assert fixed["e"]["classification"] == "unknown"
-    assert fixed["f"]["classification"] == "verified_fact" and fixed["g"]["classification"] == "unknown"
+    assert fixed["f"]["classification"] == "third_party_claim"  # one independent source is not verification
+    assert fixed["h"]["classification"] == "verified_fact" and fixed["g"]["classification"] == "unknown"
     assert fixed["n"] == 3
     assert any("E999" in n for n in notes) and any("citation [E999]" in n for n in notes)
     assert repair_refs({"s": "clean [E001]"}, EvidenceLedger())[1] == ["$.s: removed unknown citation [E001]"]

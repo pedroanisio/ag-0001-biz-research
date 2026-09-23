@@ -68,7 +68,8 @@ PRIORITY_CONCEPTS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (5, ("trust", "confianca", "confianza", "confiance", "vertrauen")),
     (3, ("privacy", "privacidade", "privacidad", "confidentialite", "datenschutz", "lgpd", "rgpd", "dsgvo", "gdpr")),
     (3, ("terms", "termos", "terminos", "conditions", "cgu", "cgv", "agb", "nutzungsbedingungen")),
-    (3, ("legal", "juridico", "mentions-legales", "impressum", "aviso-legal")),
+    # legal notices name the legal entity (Impressum and mentions légales are mandatory in DE/FR)
+    (6, ("legal", "juridico", "mentions-legales", "impressum", "aviso-legal", "imprint")),
     (4, ("contact", "contato", "contacto", "kontakt", "fale-conosco")),
     (6, ("team", "equipe", "equipo")),
     (8, ("leadership", "lideranca", "liderazgo", "fuehrung", "direction")),
@@ -94,6 +95,7 @@ SKIP_EXTENSIONS = (
     ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".css", ".js",
     ".zip", ".mp4", ".mp3", ".woff", ".woff2", ".ttf", ".xml", ".json", ".rss", ".atom",
 )
+JS_SHELL_MAX_TEXT = 300  # below this much server-rendered text, a script-heavy page is an app shell
 TRACKING_PARAMS = re.compile(r"^(utm_|fbclid|gclid|mc_|ref$)")
 DEFAULT_UA = "bi-agent/1.0 (+business research crawler; respects robots.txt)"
 
@@ -110,6 +112,7 @@ class Page:
     lang: str | None = None
     fetched_at: str = ""
     score: int = 0
+    js_rendered: bool = False  # the HTML is an app shell whose content only appears after JavaScript runs
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -191,6 +194,8 @@ def score_path(url: str, depth: int, site_lang: str | None = None) -> int:
 def extract(url: str, html: str, status: int = 200) -> Page:
     """Pure HTML → Page extraction (no network). Text is capped at 30k chars."""
     soup = BeautifulSoup(html, "html.parser")
+    scripts = len([s for s in soup.find_all("script") if s.get("type") != "application/ld+json"])
+    app_root = soup.find(id=re.compile(r"^(root|app|__next|__nuxt|___gatsby|svelte)$")) is not None
     for tag in soup(["script", "style", "noscript", "svg", "iframe", "template"]):
         if tag.name == "script" and tag.get("type") == "application/ld+json":
             continue
@@ -228,10 +233,11 @@ def extract(url: str, html: str, status: int = 200) -> Page:
             links.append(absolute)
     text = re.sub(r"[ \t\r\f\v]+", " ", soup.get_text("\n"))
     text = re.sub(r"\n\s*\n+", "\n", text).strip()[:30_000]
+    js_rendered = len(text) < JS_SHELL_MAX_TEXT and (scripts >= 3 or app_root)
     return Page(
         url=canonical(url), status=status, title=title[:300], description=desc[:1000],
         text=text, links=links, json_ld=json_ld[:10], lang=str(lang) if lang else None,
-        fetched_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        fetched_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), js_rendered=js_rendered,
     )
 
 

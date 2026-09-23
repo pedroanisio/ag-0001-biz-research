@@ -36,6 +36,31 @@ class SourceType(str, Enum):
     THIRD_PARTY = "third_party"
 
 
+class SourceKind(str, Enum):
+    """What a source is, in the order of preference the research brief sets (tier 1 is best)."""
+
+    GOVERNMENT_REGULATORY = "government_regulatory"
+    COMPANY_FILING = "company_filing"
+    OFFICIAL_COMPANY = "official_company"
+    INVESTOR_DISCLOSURE = "investor_disclosure"
+    PARTNER_CUSTOMER = "partner_customer"
+    INDUSTRY_PUBLICATION = "industry_publication"
+    NEWS = "news"
+    DATABASE_AGGREGATOR = "database_aggregator"
+    FORUM_SOCIAL = "forum_social"
+
+    @property
+    def tier(self) -> int:
+        return list(SourceKind).index(self) + 1
+
+
+# A record from a registry, regulator or statutory filing establishes a fact on its own.
+PRIMARY_RECORD_KINDS = {SourceKind.GOVERNMENT_REGULATORY, SourceKind.COMPANY_FILING}
+# Sources that cannot count as independent confirmation: the company speaking for itself, and
+# forums/social media, which the brief allows only as supporting evidence.
+NOT_INDEPENDENT_KINDS = {SourceKind.OFFICIAL_COMPANY, SourceKind.INVESTOR_DISCLOSURE, SourceKind.FORUM_SOCIAL}
+
+
 # --------------------------------------------------------------------------- evidence
 
 
@@ -48,6 +73,7 @@ class Evidence(Strict):
     excerpt: str = Field(max_length=2000)
     published: str | None = None
     retrieved_at: str
+    source_kind: SourceKind | None = None  # None only in runs saved before source kinds existed
 
     @field_validator("id")
     @classmethod
@@ -99,6 +125,7 @@ class EvidenceLedger:
         excerpt: str,
         retrieved_at: str,
         published: str | None = None,
+        source_kind: SourceKind | None = None,
     ) -> Evidence:
         existing = self.id_for_url(url)
         if existing is not None:
@@ -113,6 +140,7 @@ class EvidenceLedger:
             excerpt=excerpt[:2000],
             published=published,
             retrieved_at=retrieved_at,
+            source_kind=source_kind,
         )
         self._items[new_id] = item
         self._by_url[normalize_url(url)] = new_id
@@ -121,7 +149,9 @@ class EvidenceLedger:
     def index_text(self) -> str:
         """Compact id → source listing for prompts."""
         return "\n".join(
-            f"[{e.id}] ({e.source_type.value}) {e.title} — {e.publisher} — {e.url}" for e in self
+            f"[{e.id}] ({e.source_type.value}{', ' + e.source_kind.value if e.source_kind else ''}) "
+            f"{e.title} — {e.publisher} — {e.url}"
+            for e in self
         )
 
     def save(self, path: Path) -> None:
@@ -133,6 +163,47 @@ class EvidenceLedger:
         if not isinstance(raw, list):
             raise ValueError("evidence file must contain a list")
         return cls([Evidence.model_validate(x) for x in raw])
+
+
+def _host(url: str) -> str:
+    host = re.sub(r"^https?://", "", url.strip().lower()).split("/", 1)[0].split(":", 1)[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def verified_fact_supported(items: list[Evidence]) -> bool:
+    """A verified fact needs a primary record (registry, regulator, statutory filing) or at least two
+    independent third-party sources on different domains. This is the brief's cross-checking rule."""
+    if any(e.source_kind in PRIMARY_RECORD_KINDS for e in items):
+        return True
+    independent = {
+        _host(e.url) for e in items
+        if e.source_type is SourceType.THIRD_PARTY and e.source_kind not in NOT_INDEPENDENT_KINDS
+    }
+    return len(independent) >= 2
+
+
+def supported_classification(cls: str, items: list[Evidence]) -> str:
+    """The strongest classification the cited evidence supports.
+
+    verified_fact without enough independent confirmation becomes third_party_claim (or
+    company_claim when only the company says so); company_claim needs a first-party source,
+    third_party_claim a third-party one; a sourced claim with no evidence left is an inference.
+    """
+    sourced = {Classification.VERIFIED_FACT.value, Classification.COMPANY_CLAIM.value,
+               Classification.THIRD_PARTY_CLAIM.value}
+    if cls not in sourced:
+        return cls
+    if not items:
+        return Classification.ANALYTICAL_INFERENCE.value
+    kinds = {e.source_type for e in items}
+    first, third = SourceType.FIRST_PARTY in kinds, SourceType.THIRD_PARTY in kinds
+    if cls == Classification.VERIFIED_FACT.value and not verified_fact_supported(items):
+        return Classification.THIRD_PARTY_CLAIM.value if third else Classification.COMPANY_CLAIM.value
+    if cls == Classification.COMPANY_CLAIM.value and not first:
+        return Classification.THIRD_PARTY_CLAIM.value
+    if cls == Classification.THIRD_PARTY_CLAIM.value and not third:
+        return Classification.COMPANY_CLAIM.value
+    return cls
 
 
 def normalize_url(url: str) -> str:
@@ -198,7 +269,17 @@ class Attr(Strict):
 # --------------------------------------------------------------------------- stage outputs
 
 
+def _require_website_subject(schema: dict) -> None:
+    schema.setdefault("required", [])
+    if "website_subject" not in schema["required"]:
+        schema["required"].append("website_subject")
+
+
 class Identity(Strict):
+    # website_subject is required in the schema the model fills; the default lets older runs load.
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, json_schema_extra=_require_website_subject)
+
+    website_subject: Attr = Field(default_factory=Attr)  # the company itself, or a product/brand of it
     company_name: Attr
     legal_name: Attr
     parent_company: Attr
@@ -294,6 +375,7 @@ class SourceRef(Strict):
     publisher: str = Field(max_length=200)
     excerpt: str = Field(max_length=1500)
     published: str | None = Field(default=None, max_length=40)
+    source_kind: SourceKind
 
 
 class RawFinding(Strict):
@@ -547,8 +629,9 @@ def check_refs(obj: BaseModel, ledger: EvidenceLedger) -> list[str]:
 def check_classifications(obj: BaseModel, ledger: EvidenceLedger) -> list[str]:
     """Reject classifications that the cited evidence cannot support.
 
-    verified_fact needs at least one third-party source; company_claim needs at least one
-    first-party source; third_party_claim needs at least one third-party source.
+    verified_fact needs a primary record or two independent third-party sources
+    (:func:`verified_fact_supported`); company_claim needs at least one first-party source;
+    third_party_claim needs at least one third-party source.
     """
     errors: list[str] = []
     for model, path in _models(obj):
@@ -556,9 +639,11 @@ def check_classifications(obj: BaseModel, ledger: EvidenceLedger) -> list[str]:
         ids = getattr(model, "evidence_ids", None)
         if cls is None or ids is None:
             continue
-        kinds = {ledger.get(i).source_type for i in ids if ledger.has(i)}
-        if cls == Classification.VERIFIED_FACT and SourceType.THIRD_PARTY not in kinds:
-            errors.append(f"{path}: verified_fact requires independent (third_party) evidence")
+        items = [ledger.get(i) for i in ids if ledger.has(i)]
+        kinds = {e.source_type for e in items}
+        if cls == Classification.VERIFIED_FACT and not verified_fact_supported(items):
+            errors.append(f"{path}: verified_fact requires a primary record (government/regulatory or filing) "
+                          "or two independent third_party sources on different domains")
         elif cls == Classification.COMPANY_CLAIM and SourceType.FIRST_PARTY not in kinds:
             errors.append(f"{path}: company_claim requires first_party evidence")
         elif cls == Classification.THIRD_PARTY_CLAIM and SourceType.THIRD_PARTY not in kinds:
@@ -581,25 +666,6 @@ def semantic_errors(obj: BaseModel, ledger: EvidenceLedger) -> list[str]:
 
 
 # --------------------------------------------------------------------------- mechanical repair
-
-_SOURCED = {c.value for c in (Classification.VERIFIED_FACT, Classification.COMPANY_CLAIM, Classification.THIRD_PARTY_CLAIM)}
-
-
-def _supported(cls: str, kinds: set[SourceType]) -> str:
-    """The strongest classification the cited evidence supports (same rules as the research stage)."""
-    if cls not in _SOURCED:
-        return cls
-    if not kinds:
-        return Classification.ANALYTICAL_INFERENCE.value
-    first, third = SourceType.FIRST_PARTY in kinds, SourceType.THIRD_PARTY in kinds
-    if cls == Classification.VERIFIED_FACT.value and not third:
-        return Classification.COMPANY_CLAIM.value
-    if cls == Classification.COMPANY_CLAIM.value and not first:
-        return Classification.THIRD_PARTY_CLAIM.value
-    if cls == Classification.THIRD_PARTY_CLAIM.value and not third:
-        return Classification.COMPANY_CLAIM.value
-    return cls
-
 
 def repair_refs(payload: Any, ledger: EvidenceLedger) -> tuple[Any, list[str]]:
     """Fix, without another model call, the reference errors :func:`semantic_errors` would reject.
@@ -633,7 +699,7 @@ def repair_refs(payload: Any, ledger: EvidenceLedger) -> tuple[Any, list[str]]:
                 out["evidence_ids"] = kept
                 cls = out.get("classification")
                 if isinstance(cls, str):
-                    new = _supported(cls, {ledger.get(i).source_type for i in kept})
+                    new = supported_classification(cls, [ledger.get(i) for i in kept])
                     if "value" in out and out["value"] is None and new != cls:
                         new = Classification.UNKNOWN.value  # an attribute with no value can only be unknown
                     if new != cls:
@@ -647,3 +713,30 @@ def repair_refs(payload: Any, ledger: EvidenceLedger) -> tuple[Any, list[str]]:
         return node
 
     return walk(payload, "$"), notes
+
+
+# --------------------------------------------------------------------------- source-kind sanity
+
+# Hosts that are governments, regulators, courts, official registries or patent/trademark offices.
+_OFFICIAL_HOST = re.compile(
+    r"(^|\.)(gov|gouv|gob|gv|govt|go|admin\.ch|bund\.de|europa\.eu|wipo\.int|epo\.org|justice)(\.|$)"
+    r"|(^|\.)(companieshouse|find-and-update\.company-information\.service|handelsregister|unternehmensregister"
+    r"|bundesanzeiger|infogreffe|inpi|bodacc|boe|registradores|rmc|cnmv|cvm|cmvm|amf-france|consob"
+    r"|zefix|shab|justiz|firmenbuch|siger|igj|cnv|cmfchile|rues|supersociedades|jucesp|jucerja|jucemg"
+    r"|receita|b3|sec|edgar|uspto|euipo)\.",
+    re.IGNORECASE,
+)
+
+
+def plausible_source_kind(kind: SourceKind, url: str, on_site: bool) -> SourceKind:
+    """Lower a source kind the URL cannot back up.
+
+    The research model labels each source; a label that would let one source establish a
+    verified fact (a primary record) is only kept when the host is an official one. The company's
+    own pages are official_company unless they host a filing or investor disclosure.
+    """
+    if on_site:
+        return kind if kind in {SourceKind.COMPANY_FILING, SourceKind.INVESTOR_DISCLOSURE} else SourceKind.OFFICIAL_COMPANY
+    if kind in PRIMARY_RECORD_KINDS and not _OFFICIAL_HOST.search(_host(url)):
+        return SourceKind.DATABASE_AGGREGATOR  # e.g. a CNPJ lookup site that copies the registry
+    return kind

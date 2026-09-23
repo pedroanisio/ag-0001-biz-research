@@ -30,7 +30,7 @@ bi-agent --out runs/acme narrate                             # narrative.json
 bi-agent --out runs/acme report                              # report.md
 ```
 
-Options: `--model` (default `claude-sonnet-5`, or `BI_AGENT_MODEL`), `--lang` (see below), `--max-pages` (60), `--max-tokens` per response (64k; responses are streamed, and a truncated response stops the stage instead of being retried), `--max-search-uses` per research topic group (10), `--delay` between page fetches (0.5 s), `-v`. Global options go before the stage name, and `--url` goes after it.
+Options: `--model` (default `claude-sonnet-5`, or `BI_AGENT_MODEL`), `--lang` (see below), `--max-pages` (60), `--max-tokens` per response (64k; responses are streamed, and a truncated response stops the stage instead of being retried), `--max-search-uses` per research call (10), `--max-fetch-uses` per research call (3, 0 disables `web_fetch`), `--followup-rounds` (2), `--delay` between page fetches (0.5 s), `-v`. Global options go before the stage name, and `--url` goes after it.
 
 ## Languages
 
@@ -46,12 +46,22 @@ Supported: English (`en`), Brazilian Portuguese (`pt-br`), French (`fr`), German
 Every model output crosses a typed boundary with five controls:
 
 1. **Typed parse that rejects unknown fields.** Each stage forces a tool call whose input schema is a pydantic model with `extra="forbid"` (`bi_agent/models.py`).
-2. **Semantic validation the schema cannot express.** Every `evidence_ids` entry and every inline `[E###]` citation must resolve in the evidence ledger; `verified_fact` requires at least one third-party source; `company_claim` requires a first-party source; the ten strategic questions and eight maturity dimensions must appear with their exact text; market sizing requires a source, year, methodology and limitations (`models.semantic_errors`).
+2. **Semantic validation the schema cannot express.** Every `evidence_ids` entry and every inline `[E###]` citation must resolve in the evidence ledger; `verified_fact` requires a primary record (government, regulator, registry or statutory filing) or two independent third-party sources on different domains (the company's own material and forums never count as independent); `company_claim` requires a first-party source; the ten strategic questions and eight maturity dimensions must appear with their exact text; market sizing requires a source, year, methodology and limitations (`models.semantic_errors`).
 3. **Defined failure path with a typed error.** Reference errors are repaired in code before validation, with no extra model call: evidence ids and `[E###]` citations missing from the ledger are removed, and a classification the remaining evidence cannot support is lowered (`verified_fact` backed only by the company becomes `company_claim`; a claim left with no evidence becomes `analytical_inference`). These are the same rules the research stage applies to findings, and every repair is logged as a warning (`models.repair_refs`). Everything else (missing questions, wrong types, unknown fields) is fed back to the model for a bounded number of attempts, then `LLMOutputError` carries the error list to the CLI (exit code 2). An Anthropic API error ends the run with exit code 3 and a one-line message.
-4. **Adversarial tests.** `tests/` feed unknown fields, fabricated evidence ids, mis-classified claims, unsearched source URLs, text-only model turns, search error blocks, off-site redirects and robots-blocked paths, and assert the failure behaviour. 109 tests, 98 % branch coverage, no network.
+4. **Adversarial tests.** `tests/` feed unknown fields, fabricated evidence ids, mis-classified claims, unsearched source URLs, text-only model turns, search error blocks, off-site redirects and robots-blocked paths, and assert the failure behaviour. 120 tests, 98 % branch coverage, no network.
 5. **Loop bounds owned by ordinary code.** `max_pages`, `max_fetches`, `max_attempts`, `max_research_turns`, `max_search_uses`, five sitemaps, twelve research topics in five groups.
 
-The research stage adds one more guard: a finding's source URL is accepted only if `web_search` returned that URL in the same call (or it belongs to the company's own site). Findings whose sources the model reconstructed are discarded and listed at the end of the report under "Discarded during verification".
+The research stage adds two more guards:
+
+- **Retrieved sources only.** A finding's source URL is accepted only if `web_search` returned it or `web_fetch` retrieved it in the same call (or it belongs to the company's own site). Findings whose sources the model reconstructed are discarded and listed at the end of the report under "Discarded during verification".
+- **Source kinds.** Every source is labelled with the brief's source hierarchy: government/regulator, statutory filing, company material, investor disclosure, partner/customer, industry publication, news, database/aggregator, forum/social. The label is shown in the Sources table and in the evidence index the model sees. A label that would let a single source verify a fact (a primary record) is kept only for official hosts (`.gov`, `.gouv`, `.gob`, Companies House, Handelsregister, Infogreffe, CVM, SEC …). A CNPJ-lookup or registry-copy site becomes a database/aggregator.
+
+## Research depth
+
+- **Topic groups, then follow-up rounds.** After the five topic groups, up to `--followup-rounds` (2) follow-up calls are each given everything found so far. They investigate the entities discovered (parent company, owners and investors, founders, major customers and partners, key competitors), contradictions, single-source claims and recorded gaps. Research stops early once a round adds fewer than 3 new findings: that is the point of diminishing returns.
+- **Reading, not just searching.** Research calls also have `web_fetch` (up to `--max-fetch-uses`, 3 per call, 20k tokens per page), so a registry entry, filing or annual report can be read in full.
+- **Thin or JavaScript-rendered websites.** The crawler flags pages that are app shells (almost no text, script-driven). Under 20k characters or 5 pages the site counts as thin: every research call gets 50 % more searches, one extra follow-up round is allowed, the prompts tell the model to rely on external sources, and the report says so at the top. The crawler does not run JavaScript.
+- **Product or company.** `identify` records what the website represents (`website_subject`: the company itself, or a product or brand of a named organisation), using legal notices, terms, copyright lines and registration numbers. Legal-notice pages (Impressum, mentions légales, aviso legal) are fetched early for this. Research searches under the related names too (legal name, brands, parent), and `analyze` covers both the product and the organisation when they differ.
 
 ## Layout
 
@@ -68,7 +78,7 @@ bi_agent/cli.py       subcommands
 
 ## Cost and size
 
-One full run is 5 structured calls (plus any validation retries) and 5 research calls with up to 10 searches each, so at most 50 searches. Page text sent to the model is capped at 260k characters (6k per page).
+One full run is 5 structured calls (plus any validation retries) and 6–7 research calls (5 topic groups plus 1–2 follow-up rounds; one more on thin sites), each with up to 10 searches and 3 page fetches, so at most 70 searches (105 on a thin site). Page text sent to the model is capped at 260k characters (6k per page).
 
 What keeps the bill down:
 

@@ -176,10 +176,11 @@ def raw_findings_payload(url: str = "https://news.test/acme-raises") -> dict:
         "findings": [
             {"topic": "funding", "statement": "Acme raised a Series A.", "classification": "third_party_claim",
              "sources": [{"url": url, "title": "Acme raises", "publisher": "News Test",
-                          "excerpt": "Acme raised $5M.", "published": "2024-03-01"}]},
+                          "excerpt": "Acme raised $5M.", "published": "2024-03-01", "source_kind": "news"}]},
             {"topic": "financials", "statement": "Revenue is not disclosed.", "classification": "unknown", "sources": []},
             {"topic": "news", "statement": "Fabricated claim.", "classification": "verified_fact",
-             "sources": [{"url": "https://made-up.test/nothing", "title": "x", "publisher": "x", "excerpt": "x"}]},
+             "sources": [{"url": "https://made-up.test/nothing", "title": "x", "publisher": "x", "excerpt": "x",
+                          "source_kind": "news"}]},
         ],
         "not_found": ["earnings reports"],
     }
@@ -238,7 +239,7 @@ def narrative_payload() -> dict:
 def third_party_id(kwargs: dict) -> str:
     """Find a third-party evidence id in the ledger text of an analyze/narrate prompt (E001 if none)."""
     for line in kwargs["messages"][0]["content"].splitlines():
-        if "(third_party)" in line:
+        if "(third_party" in line:
             return line.split("]")[0].strip("[")
     return "E001"
 

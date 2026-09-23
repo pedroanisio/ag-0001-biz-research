@@ -95,6 +95,8 @@ def render_report(
       f"{t('evidence_items', n=len(ledger), pages=meta.get('pages', 0))}\n")
     labels = [f"*{t(k)}*" for k in ("verified_fact", "company_claim", "third_party_claim", "analytical_inference", "unknown")]
     w(t("key", labels=", ".join(labels[:-1]) + f" {t('or')} " + labels[-1]) + "\n")
+    if meta.get("thin_site"):
+        w(f"> {t('thin_site_note', chars=meta.get('site_chars', 0), js=meta.get('js_rendered_pages', 0))}\n")
 
     section(1, n.executive_summary)
 
@@ -102,6 +104,7 @@ def render_report(
     w(_head(t("field"), t("value")))
     rows = [
         ("company", attr(identity.company_name)), ("legal_entity", attr(identity.legal_name)),
+        ("website_subject", attr(identity.website_subject)),
         ("website", meta.get("start", meta.get("url", ""))), ("headquarters", attr(identity.headquarters)),
         ("founded", attr(identity.founding_year)), ("founders", attr(identity.founders)),
         ("ownership", attr(identity.ownership_structure)),
@@ -249,12 +252,13 @@ def render_report(
     section(21)
     body = "\n".join(out)
     used = _cited_ids(body)
-    w(_head(t("id"), t("title_col"), t("publisher"), t("url"), t("published"), t("type"), t("accessed")))
+    w(_head(t("id"), t("title_col"), t("publisher"), t("url"), t("published"), t("type"), t("source_kind"),
+            t("accessed")))
     for e in ledger:
         if e.id in used:
             accessed = (e.retrieved_at or "")[:10] or access_date  # when the pipeline fetched it
             w(f"| {e.id} | {_cell(e.title)} | {_cell(e.publisher)} | {e.url} | {e.published or t('n_a')} | "
-              f"{t(e.source_type.value)} | {accessed} |")
+              f"{t(e.source_type.value)} | {t('src.' + e.source_kind.value) if e.source_kind else '—'} | {accessed} |")
     if findings.rejected:
         w(f"\n{t('discarded')}\n")
         for r in findings.rejected:
