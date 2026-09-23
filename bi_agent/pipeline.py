@@ -13,6 +13,7 @@ Run directory layout::
     analysis.json   Analysis
     narrative.json  Narrative
     report.md       rendered report
+    report.pdf      the same report, typeset for reading and sharing
     usage.json      tokens, web searches and estimated cost per stage
     research.partial.json  research progress, present only while research is unfinished
 """
@@ -54,6 +55,7 @@ from .models import (
     repair_refs,
     semantic_errors,
 )
+from .pdf import render_pdf
 from .report import render_report
 
 log = logging.getLogger("bi_agent")
@@ -568,6 +570,7 @@ def stage_report(store: RunStore) -> str:
         lang=store.lang(),
     )
     store.path("report.md").write_text(md, encoding="utf-8")
+    render_pdf(md, store.path("report.pdf"), lang=store.lang())
     return md
 
 

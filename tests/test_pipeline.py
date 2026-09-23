@@ -369,6 +369,7 @@ def test_cli_run_and_stage_by_stage(tmp_path, http_client, monkeypatch, capsys):
         assert cli.main(common + [stage], client_factory=factory, http_client=http_client) == 0, stage
     assert "report written" in capsys.readouterr().out
     assert (tmp_path / "r" / "report.md").exists()
+    assert (tmp_path / "r" / "report.pdf").read_bytes().startswith(b"%PDF")
     assert cli.main(common + ["-v", "run", "--url", SITE], client_factory=factory, http_client=http_client) == 0
 
 

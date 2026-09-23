@@ -188,6 +188,10 @@ STRINGS: dict[str, tuple[str, str, str, str, str]] = {
     "s19": ("Analyst Observations", "Observações do Analista", "Observations de l'analyste", "Beobachtungen des Analysten", "Observaciones del analista"),
     "s20": ("Open Questions", "Questões em Aberto", "Questions ouvertes", "Offene Fragen", "Preguntas abiertas"),
     "s21": ("Sources", "Fontes", "Sources", "Quellen", "Fuentes"),
+    # PDF page chrome
+    "contents": ("Contents", "Sumário", "Sommaire", "Inhalt", "Índice"),
+    "page_of": ("Page {n} of {total}", "Página {n} de {total}", "Page {n} sur {total}", "Seite {n} von {total}",
+                "Página {n} de {total}"),
     # snapshot rows
     "field": ("Field", "Campo", "Champ", "Feld", "Campo"),
     "value": ("Value", "Valor", "Valeur", "Wert", "Valor"),

@@ -27,8 +27,10 @@ bi-agent --out runs/acme research                            # findings.json, ex
 bi-agent --out runs/acme resolve                             # identity.json: website identity refined by research
 bi-agent --out runs/acme analyze                             # analysis.json
 bi-agent --out runs/acme narrate                             # narrative.json
-bi-agent --out runs/acme report                              # report.md
+bi-agent --out runs/acme report                              # report.pdf (and report.md, its source)
 ```
+
+The PDF is typeset with reportlab from `report.md`: cover page, table of contents and PDF bookmarks, colour-coded classification labels, and `[E012]` citations that link to their row in the Sources table. Re-running `report` regenerates both files from the saved stage outputs without any API call.
 
 Options: `--model` (default `claude-sonnet-5`, or `BI_AGENT_MODEL`), `--lang` (see below), `--max-pages` (60), `--max-tokens` per response (64k; responses are streamed, and a truncated response stops the stage instead of being retried), `--max-search-uses` per research call (10), `--max-fetch-uses` per research call (3, 0 disables `web_fetch`), `--followup-rounds` (2), `--delay` between page fetches (0.5 s), `-v`. Global options go before the stage name, and `--url` goes after it.
 
@@ -72,6 +74,7 @@ bi_agent/llm.py       Anthropic wrapper: forced structured output, bounded retri
 bi_agent/prompts.py   the analyst brief per stage (the research spec lives here)
 bi_agent/pipeline.py  stages and the run directory
 bi_agent/report.py    Markdown renderer (adds no facts)
+bi_agent/pdf.py       typesets report.md as report.pdf (reportlab)
 bi_agent/i18n.py      supported languages, site-language detection, translated report strings
 bi_agent/cli.py       subcommands
 ```

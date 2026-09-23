@@ -96,7 +96,7 @@ def main(
         if args.stage == "run":
             md = pipeline.run_all(store, args.url, make_crawler(args, http_client), llm, args.lang,
                                   followup_rounds=args.followup_rounds)
-            print(f"report written to {store.path('report.md')} ({len(md)} chars)")
+            print(f"report written to {store.path('report.pdf')} (Markdown: {store.path('report.md')})")
         elif args.stage == "crawl":
             pages = pipeline.stage_crawl(store, args.url, make_crawler(args, http_client), args.lang)
             print(f"crawled {len(pages)} pages into {store.dir} (site language: {store.site_lang()}, "
@@ -121,7 +121,7 @@ def main(
             print("narrative written")
         else:
             md = pipeline.stage_report(store)
-            print(f"report written to {store.path('report.md')} ({len(md)} chars)")
+            print(f"report written to {store.path('report.pdf')} (Markdown: {store.path('report.md')})")
         if llm is not None:
             _print_usage(store)
     except anthropic.APIStatusError as exc:
