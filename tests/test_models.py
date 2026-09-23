@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from bi_agent.models import (
+    Analysis,
+    Attr,
+    Claim,
+    Classification,
+    Evidence,
+    EvidenceLedger,
+    Narrative,
+    SourceType,
+    check_classifications,
+    check_refs,
+    normalize_url,
+    semantic_errors,
+)
+from tests.conftest import analysis_payload, narrative_payload
+
+
+def _ledger() -> EvidenceLedger:
+    led = EvidenceLedger()
+    led.add(source_type=SourceType.FIRST_PARTY, url="https://acme.test/", title="Home", publisher="acme.test",
+            excerpt="x", retrieved_at="2026-01-01T00:00:00+00:00")
+    led.add(source_type=SourceType.THIRD_PARTY, url="https://news.test/a", title="News", publisher="News",
+            excerpt="y", retrieved_at="2026-01-01T00:00:00+00:00")
+    return led
+
+
+def test_evidence_rejects_bad_id_and_url():
+    with pytest.raises(ValidationError):
+        Evidence(id="X1", source_type="first_party", url="https://a.test", title="t", publisher="p", excerpt="e",
+                 retrieved_at="now")
+    with pytest.raises(ValidationError):
+        Evidence(id="E001", source_type="first_party", url="ftp://a.test", title="t", publisher="p", excerpt="e",
+                 retrieved_at="now")
+
+
+def test_evidence_rejects_unknown_fields():
+    with pytest.raises(ValidationError):
+        Evidence(id="E001", source_type="first_party", url="https://a.test", title="t", publisher="p", excerpt="e",
+                 retrieved_at="now", extra_field="nope")
+
+
+def test_ledger_assigns_ids_and_dedups_by_url(tmp_path):
+    led = _ledger()
+    dup = led.add(source_type=SourceType.THIRD_PARTY, url="http://WWW.news.test/a/", title="dup", publisher="p",
+                  excerpt="z", retrieved_at="t")
+    assert dup.id == "E002" and len(led) == 2
+    assert led.id_for_url("https://news.test/a#frag") == "E002"
+    assert led.has("E001") and not led.has("E009")
+    assert "[E001] (first_party) Home" in led.index_text()
+    led.save(tmp_path / "e.json")
+    again = EvidenceLedger.load(tmp_path / "e.json")
+    assert [e.id for e in again] == ["E001", "E002"]
+
+
+def test_ledger_load_rejects_non_list(tmp_path):
+    (tmp_path / "e.json").write_text('{"a": 1}')
+    with pytest.raises(ValueError):
+        EvidenceLedger.load(tmp_path / "e.json")
+
+
+def test_normalize_url():
+    assert normalize_url("HTTPS://www.Example.com/path/#x") == "example.com/path"
+
+
+@pytest.mark.parametrize("cls", ["verified_fact", "company_claim", "third_party_claim"])
+def test_claim_sourced_classification_requires_evidence(cls):
+    with pytest.raises(ValidationError):
+        Claim(statement="s", classification=cls, evidence_ids=[])
+    assert Claim(statement="s", classification=cls, evidence_ids=["E001"]).evidence_ids == ["E001"]
+
+
+def test_claim_unknown_and_inference_need_no_evidence():
+    assert Claim(statement="s", classification="unknown").evidence_ids == []
+    assert Claim(statement="s", classification="analytical_inference").classification is Classification.ANALYTICAL_INFERENCE
+
+
+def test_claim_rejects_bad_evidence_id():
+    with pytest.raises(ValidationError):
+        Claim(statement="s", classification="company_claim", evidence_ids=["bogus"])
+
+
+def test_attr_consistency_rules():
+    with pytest.raises(ValidationError):
+        Attr(value=None, classification="company_claim", evidence_ids=["E001"])
+    with pytest.raises(ValidationError):
+        Attr(value="x", classification="unknown")
+    with pytest.raises(ValidationError):
+        Attr(value="x", classification="company_claim", evidence_ids=[])
+    assert Attr(value="x", classification="analytical_inference").value == "x"
+
+
+def test_check_refs_flags_unknown_ids_and_citations():
+    led = _ledger()
+    c = Claim(statement="cites [E077] inline", classification="company_claim", evidence_ids=["E001", "E099"])
+    errors = check_refs(c, led)
+    assert any("E099" in e for e in errors) and any("[E077]" in e for e in errors)
+    assert check_refs(Claim(statement="ok [E002]", classification="company_claim", evidence_ids=["E001"]), led) == []
+
+
+def test_check_classifications_matches_source_type():
+    led = _ledger()
+    bad_fact = Claim(statement="s", classification="verified_fact", evidence_ids=["E001"])  # first-party only
+    bad_company = Claim(statement="s", classification="company_claim", evidence_ids=["E002"])  # third-party only
+    bad_third = Claim(statement="s", classification="third_party_claim", evidence_ids=["E001"])
+    ok_fact = Claim(statement="s", classification="verified_fact", evidence_ids=["E001", "E002"])
+    assert check_classifications(bad_fact, led) and check_classifications(bad_company, led)
+    assert check_classifications(bad_third, led)
+    assert check_classifications(ok_fact, led) == []
+    assert semantic_errors(ok_fact, led) == []
+
+
+def test_analysis_requires_exact_strategic_questions_and_maturity_dimensions():
+    p = analysis_payload()
+    p["strategic"][0]["question"] = "A different question?"
+    with pytest.raises(ValidationError, match="strategic answers must cover"):
+        Analysis.model_validate(p)
+    p = analysis_payload()
+    p["maturity"][0]["dimension"] = "Vibes maturity"
+    with pytest.raises(ValidationError, match="maturity rows must cover"):
+        Analysis.model_validate(p)
+    p = analysis_payload()
+    p["analyst_observations"][0] = {"statement": "s", "classification": "company_claim", "evidence_ids": ["E001"]}
+    with pytest.raises(ValidationError, match="analytical_inference"):
+        Analysis.model_validate(p)
+    assert Analysis.model_validate(analysis_payload()).swot.strengths
+
+
+def test_market_sizing_requires_source_and_methodology():
+    p = analysis_payload()
+    p["market"]["sizing"] = [{"metric": "TAM", "value": "$1B", "year": "2025", "methodology": "", "limitations": "vendor",
+                              "evidence_ids": ["E001"]}]
+    with pytest.raises(ValidationError):
+        Analysis.model_validate(p)
+    p["market"]["sizing"] = [{"metric": "TAM", "value": "$1B", "year": "2025", "methodology": "top-down",
+                              "limitations": "vendor", "evidence_ids": []}]
+    with pytest.raises(ValidationError):
+        Analysis.model_validate(p)
+
+
+def test_narrative_executive_summary_bounds():
+    p = narrative_payload()
+    p["executive_summary"] = ["one", "two"]
+    with pytest.raises(ValidationError):
+        Narrative.model_validate(p)
+    assert len(Narrative.model_validate(narrative_payload()).executive_summary) == 5
