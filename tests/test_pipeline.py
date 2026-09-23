@@ -241,6 +241,30 @@ def test_analyze_and_narrate_then_report(store, http_client):
     assert "Identity uncertainties" in md
 
 
+def test_report_labels_offerings_judgments_and_access_dates(store, http_client):
+    _run_to(store, http_client, "narrate")
+    ledger = store.ledger()
+    ev = ledger.get("E001")
+    ev_dict = [e.model_dump(mode="json") for e in ledger]
+    ev_dict[0]["retrieved_at"] = "2020-02-03T04:05:06+00:00"
+    store.save_json("evidence.json", ev_dict)
+    md = pipeline.stage_report(store)
+    assert "| Monitor | core product | Factory operators |" in md
+    strategic = md.split("### Strategic analysis")[1].split("### Business maturity")[0]
+    assert "analytical judgments" in strategic
+    assert strategic.count("*(Analytical inference)*") == 10
+    assert f"| {ev.id} |" in md and "| 2020-02-03 |" in md.split("## 21. Sources")[1]
+
+
+def test_offering_kind_is_required_for_the_model_but_old_runs_still_load():
+    from bi_agent.models import Offering, OfferingKind
+
+    assert "kind" in Offering.model_json_schema()["required"]
+    legacy = {"name": "X", "target_customer": "t", "problem_solved": "p", "key_capabilities": "k",
+              "business_benefit": "b", "monetization": "m", "classification": "company_claim", "evidence_ids": ["E001"]}
+    assert Offering.model_validate(legacy).kind is OfferingKind.OTHER
+
+
 def test_report_renders_sizing_and_omits_uncited_sources(store, http_client):
     def with_sizing(kw):
         p = analysis_payload(third_party_id(kw))

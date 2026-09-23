@@ -131,13 +131,13 @@ def render_report(
     w("")
 
     section(5, n.products_and_services)
-    w(_head(t("offering"), t("target_customer"), t("problem_solved"), t("capabilities"), t("benefit"),
+    w(_head(t("offering"), t("type"), t("target_customer"), t("problem_solved"), t("capabilities"), t("benefit"),
             t("monetization"), t("basis")))
     for o in signals.offerings:
-        w(f"| {_cell(o.name)} | {_cell(o.target_customer)} | {_cell(o.problem_solved)} | {_cell(o.key_capabilities)} | "
+        w(f"| {_cell(o.name)} | {t('kind.' + o.kind.value)} | {_cell(o.target_customer)} | {_cell(o.problem_solved)} | {_cell(o.key_capabilities)} | "
           f"{_cell(o.business_benefit)} | {_cell(o.monetization)} | {label(o.classification)} {_cites(o.evidence_ids)} |")
     if not signals.offerings:
-        w(f"| — | — | — | — | — | — | {t('no_offerings')} |")
+        w(f"| — | — | — | — | — | — | — | {t('no_offerings')} |")
     w("")
 
     section(6, n.customer_segments_and_use_cases)
@@ -218,8 +218,10 @@ def render_report(
         w(f"### {t(key)}\n\n" + claims(items) + "\n")
 
     w(f"### {t('strategic_analysis')}\n")
+    w(f"_{t('strategic_note')}_\n")
     for s in a.strategic:
-        w(f"**{t.question(s.question)}**\n\n{s.answer} {_cites(s.evidence_ids)}\n".replace(" \n", "\n"))
+        w(f"**{t.question(s.question)}**\n\n{s.answer} *({t('analytical_inference')})* {_cites(s.evidence_ids)}\n"
+          .replace(" \n", "\n"))
 
     w(f"### {t('business_maturity')}\n")
     w(_head(t("dimension"), t("evidence")))
@@ -250,8 +252,9 @@ def render_report(
     w(_head(t("id"), t("title_col"), t("publisher"), t("url"), t("published"), t("type"), t("accessed")))
     for e in ledger:
         if e.id in used:
+            accessed = (e.retrieved_at or "")[:10] or access_date  # when the pipeline fetched it
             w(f"| {e.id} | {_cell(e.title)} | {_cell(e.publisher)} | {e.url} | {e.published or t('n_a')} | "
-              f"{t(e.source_type.value)} | {access_date} |")
+              f"{t(e.source_type.value)} | {accessed} |")
     if findings.rejected:
         w(f"\n{t('discarded')}\n")
         for r in findings.rejected:

@@ -164,7 +164,7 @@ def signals_payload() -> dict:
     ]
     d: dict = {k: [claim(f"{k} signal")] for k in lists}
     d["offerings"] = [{
-        "name": "Monitor", "target_customer": "Factory operators", "problem_solved": "Unplanned downtime",
+        "name": "Monitor", "kind": "core_product", "target_customer": "Factory operators", "problem_solved": "Unplanned downtime",
         "key_capabilities": "Real-time telemetry, API", "business_benefit": "Less downtime",
         "monetization": "Subscription from $49/month", "classification": "company_claim", "evidence_ids": ["E001"],
     }]

@@ -33,7 +33,9 @@ cases, value propositions, pricing model, sales and distribution model, partners
 technology, IP / regulatory / certification claims, geography, named customers and case studies,
 positioning language, strategic priorities, and hiring signals from careers pages.
 Everything here comes from the company itself, so classify it company_claim (or analytical_inference
-where you are reading between the lines) and cite the page ids [E###]."""
+where you are reading between the lines) and cite the page ids [E###].
+Give every offering a kind: core_product, secondary_product, service, professional_services, subscription,
+platform, api, software, hardware, data_product, marketplace, licensing or other."""
 
 RESEARCH_SYSTEM = ANALYST_ROLE + """
 
@@ -88,12 +90,12 @@ RESEARCH_TOPICS: dict[str, str] = {
     "corporate": "legal entity, registry / regulatory filings, parent and subsidiaries, headquarters, founding year, ownership, public/private status and ticker",
     "funding": "funding rounds, investors, valuation, acquisitions made or received (Crunchbase-style sources, press releases, filings)",
     "financials": "revenue, growth, profitability, margins, annual reports, earnings, debt",
-    "leadership": "founders, CEO and executive team backgrounds, board, leadership changes and turnover",
-    "customers": "named customers, case studies on third-party sites, customer counts, transaction volumes, partner announcements",
-    "competitors": "direct and indirect competitors, incumbents, emerging alternatives, analyst or review-site category placement",
+    "leadership": "founders, CEO and executive team backgrounds, board, leadership changes and turnover; interviews, podcasts and conference presentations by the leadership, which often state strategy the website does not",
+    "customers": "named customers, case studies on third-party sites, customer counts, transaction volumes, partner announcements, partner websites and marketplace listings that name the company",
+    "competitors": "direct and indirect competitors, incumbents, emerging alternatives, competitor material that mentions the company, analyst coverage (industry-analyst reports, equity research) and review-site category placement",
     "reviews": "customer reviews on G2/Capterra/Trustpilot/app stores, complaints, employee reviews on Glassdoor",
     "hiring": "current job postings and hiring clusters, headcount, engineering vs sales intensity, locations",
-    "technology": "technical documentation, GitHub repositories, SDKs, patents, security incidents, certifications",
+    "technology": "technical documentation, GitHub repositories, SDKs, patents, trademarks (national trademark offices, WIPO), security incidents, certifications",
     "regulatory": "litigation, regulatory actions, licences, compliance certifications, data-protection issues",
     "news": "press coverage over the last three years, product launches, pivots, discontinued products, expansions",
     "market": "market category definitions, credible market size and growth estimates with methodology, industry reports",

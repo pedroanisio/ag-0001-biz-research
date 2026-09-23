@@ -217,8 +217,35 @@ class Identity(Strict):
     identity_uncertainties: list[str] = Field(default_factory=list, max_length=10)
 
 
+class OfferingKind(str, Enum):
+    CORE_PRODUCT = "core_product"
+    SECONDARY_PRODUCT = "secondary_product"
+    SERVICE = "service"
+    PROFESSIONAL_SERVICES = "professional_services"
+    SUBSCRIPTION = "subscription"
+    PLATFORM = "platform"
+    API = "api"
+    SOFTWARE = "software"
+    HARDWARE = "hardware"
+    DATA_PRODUCT = "data_product"
+    MARKETPLACE = "marketplace"
+    LICENSING = "licensing"
+    OTHER = "other"
+
+
+def _require_kind(schema: dict) -> None:
+    schema.setdefault("required", [])
+    if "kind" not in schema["required"]:
+        schema["required"].append("kind")
+
+
 class Offering(Strict):
+    # ``kind`` is required in the schema the model fills; the default only lets runs saved
+    # before the field existed still load.
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, json_schema_extra=_require_kind)
+
     name: str = Field(max_length=200)
+    kind: OfferingKind = OfferingKind.OTHER
     target_customer: str = Field(max_length=400)
     problem_solved: str = Field(max_length=600)
     key_capabilities: str = Field(max_length=800)
