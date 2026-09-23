@@ -196,3 +196,18 @@ def test_repair_refs_drops_unknown_ids_and_lowers_classifications():
     assert fixed["n"] == 3
     assert any("E999" in n for n in notes) and any("citation [E999]" in n for n in notes)
     assert repair_refs({"s": "clean [E001]"}, EvidenceLedger())[1] == ["$.s: removed unknown citation [E001]"]
+
+
+
+def test_government_press_releases_are_news_not_primary_records(tmp_path):
+    from bi_agent.models import plausible_source_kind
+
+    gov = SourceKind.GOVERNMENT_REGULATORY
+    assert plausible_source_kind(gov, "https://paraiba.pb.gov.br/noticias/pbgas-conecta", False) is SourceKind.NEWS
+    assert plausible_source_kind(gov, "https://www.sec.gov/news/press-release/2024-1", False) is SourceKind.NEWS
+    assert plausible_source_kind(gov, "https://www.gov.br/receitafederal/pt-br/cnpj", False) is gov
+    led = EvidenceLedger()
+    led.add(source_type=SourceType.THIRD_PARTY, url="https://paraiba.pb.gov.br/noticias/x", title="t", publisher="p",
+            excerpt="e", retrieved_at="r", source_kind=gov)  # saved under the older rule
+    led.save(tmp_path / "e.json")
+    assert EvidenceLedger.load(tmp_path / "e.json").get("E001").source_kind is SourceKind.NEWS

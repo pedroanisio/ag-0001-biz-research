@@ -89,7 +89,10 @@ Task: reconstruct the business behind the website from the evidence supplied (id
 external findings, evidence ledger). Produce the full analysis:
 - business model (customer type, ICP, buyer/user/economic decision maker, revenue model, go-to-market);
 - customer pains by kind (functional, financial, operational, technical, regulatory, strategic) with the
-  consequence of leaving them unsolved;
+  consequence of leaving them unsolved. A pain is a problem the company's CUSTOMERS have and its offering
+  addresses, described from the customer's side. The company's own problems (its legacy systems,
+  dependence on regulators or suppliers, exposure to new competition or regulation) are not customer
+  pains: put them in weaknesses, threats or red flags;
 - market (primary, adjacent, maturity, trends, technology shifts, regulation, behaviour change, barriers,
   switching costs, commoditisation, consolidation). Market sizing entries are allowed only when a ledger
   source provides the number; each entry needs year, methodology and limitations. Do not repeat oversized
@@ -118,7 +121,12 @@ external findings, evidence ledger). Produce the full analysis:
 NARRATE_SYSTEM = ANALYST_ROLE + """
 
 Task: write the prose sections of the Company Intelligence Report from the structured analysis supplied.
-Write paragraphs (not bullet lists). Every important factual sentence carries an inline citation in the
+Write paragraphs (not bullet lists) made of complete sentences with a subject that say who has the
+problem, who buys, who competes; a paragraph that is only a noun phrase ("Provision of cheaper energy
+for ...") is a list item, not prose. The prose must agree with the structured analysis: do not state a
+cause, figure or date differently from it, and where sources disagree, say that they disagree and cite
+both. In the problems section, write about the customers' problems, not the company's own risks.
+Every important factual sentence carries an inline citation in the
 form [E###] using ids from the ledger only. Label inferences as such in the text ("we infer", "the
 evidence suggests"). The executive summary is 5 to 10 paragraphs and must let a reader understand the
 company without reading the rest. Expose uncertainty and contradictions explicitly. Avoid marketing

@@ -30,7 +30,12 @@ def _cell(text: str) -> str:
 
 
 def _cites(ids: list[str]) -> str:
-    return " ".join(f"[{i}]" for i in ids)
+    return " ".join(f"[{i}]" for i in sorted(dict.fromkeys(ids), key=lambda i: int(i[1:])))
+
+
+def _cap(text: str) -> str:
+    """First letter upper-case, the rest untouched (so "API" stays "API")."""
+    return text[:1].upper() + text[1:]
 
 
 def _paras(paragraphs: list[str]) -> str:
@@ -130,14 +135,14 @@ def render_report(
     section(4, n.problems_it_solves)
     w(_head(t("pain_type"), t("problem"), t("consequence"), t("evidence")))
     for p in a.pains:
-        w(f"| {t('pain.' + p.kind.value)} | {_cell(p.description)} | {_cell(p.consequence_if_unsolved)} | {_cites(p.evidence_ids)} |")
+        w(f"| {_cap(t('pain.' + p.kind.value))} | {_cell(p.description)} | {_cell(p.consequence_if_unsolved)} | {_cites(p.evidence_ids)} |")
     w("")
 
     section(5, n.products_and_services)
     w(_head(t("offering"), t("type"), t("target_customer"), t("problem_solved"), t("capabilities"), t("benefit"),
             t("monetization"), t("basis")))
     for o in signals.offerings:
-        w(f"| {_cell(o.name)} | {t('kind.' + o.kind.value)} | {_cell(o.target_customer)} | {_cell(o.problem_solved)} | {_cell(o.key_capabilities)} | "
+        w(f"| {_cell(o.name)} | {_cap(t('kind.' + o.kind.value))} | {_cell(o.target_customer)} | {_cell(o.problem_solved)} | {_cell(o.key_capabilities)} | "
           f"{_cell(o.business_benefit)} | {_cell(o.monetization)} | {label(o.classification)} {_cites(o.evidence_ids)} |")
     if not signals.offerings:
         w(f"| — | — | — | — | — | — | — | {t('no_offerings')} |")
@@ -191,7 +196,7 @@ def render_report(
             t("strength"), t("difference"), t("basis")))
     order = {c: i for i, c in enumerate(CompetitorCategory)}
     for c in sorted(a.competitors, key=lambda x: order[x.category]):
-        w(f"| {_cell(c.name)} | {t('cat.' + c.category.value)} | {_cell(c.offering)} | {_cell(c.target_segment)} | "
+        w(f"| {_cell(c.name)} | {_cap(t('cat.' + c.category.value))} | {_cell(c.offering)} | {_cell(c.target_segment)} | "
           f"{_cell(c.business_model)} | {_cell(c.key_strength)} | {_cell(c.key_difference)} | "
           f"{label(c.classification)} {_cites(c.evidence_ids)} |")
     w("")
@@ -199,7 +204,7 @@ def render_report(
     section(12, n.differentiation_and_defensibility)
     w(_head(t("dimension"), t("claimed_diff"), t("observable_diff"), t("reproducibility"), t("evidence")))
     for d in a.differentiation:
-        w(f"| {_cell(d.dimension)} | {_cell(d.claimed)} | {_cell(d.observable)} | {t('repro.' + d.reproducibility.value)} | {_cites(d.evidence_ids)} |")
+        w(f"| {_cell(d.dimension)} | {_cell(d.claimed)} | {_cell(d.observable)} | {_cap(t('repro.' + d.reproducibility.value))} | {_cites(d.evidence_ids)} |")
     w("")
 
     section(13, n.customers_partnerships_ecosystem)

@@ -272,7 +272,7 @@ def test_analyze_and_narrate_then_report(store, http_client):
     for i in range(1, 22):
         assert f"\n## {i}. " in md, f"section {i} missing"
     assert "| Company | Acme Widgets *(Company claim)* [E001] |" in md
-    assert "| Rival Co | direct |" in md
+    assert "| Rival Co | Direct |" in md
     assert "Series A raised *(Third-party claim)*" in md
     assert "| E001 |" in md and "news.test/acme-raises" in md
     assert "Discarded during verification" in md
@@ -289,7 +289,7 @@ def test_report_labels_offerings_judgments_and_access_dates(store, http_client):
     ev_dict[0]["retrieved_at"] = "2020-02-03T04:05:06+00:00"
     store.save_json("evidence.json", ev_dict)
     md = pipeline.stage_report(store)
-    assert "| Monitor | core product | Factory operators |" in md
+    assert "| Monitor | Core product | Factory operators |" in md
     strategic = md.split("### Strategic analysis")[1].split("### Business maturity")[0]
     assert "analytical judgments" in strategic
     assert strategic.count("*(Analytical inference)*") == 10

@@ -231,6 +231,8 @@ def extract(url: str, html: str, status: int = 200) -> Page:
         if absolute not in seen:
             seen.add(absolute)
             links.append(absolute)
+    for tag in soup.find_all("nav") + soup.find_all(attrs={"role": "navigation"}):
+        tag.decompose()  # after link extraction: menus lead to pages but say nothing about the business
     text = re.sub(r"[ \t\r\f\v]+", " ", soup.get_text("\n"))
     text = re.sub(r"\n\s*\n+", "\n", text).strip()[:30_000]
     js_rendered = len(text) < JS_SHELL_MAX_TEXT and (scripts >= 3 or app_root)
@@ -239,6 +241,30 @@ def extract(url: str, html: str, status: int = 200) -> Page:
         text=text, links=links, json_ld=json_ld[:10], lang=str(lang) if lang else None,
         fetched_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), js_rendered=js_rendered,
     )
+
+
+BOILERPLATE_SHARE = 0.5  # a line on at least half the pages is site chrome (menus, footers, banners)
+BOILERPLATE_MIN_PAGES = 4
+
+
+def strip_boilerplate(pages: list[Page]) -> list[Page]:
+    """Remove lines that repeat across most pages (menus outside <nav>, footers, cookie banners).
+
+    The home page keeps its copy, so footer facts such as the legal entity or registration number
+    are still read once. Only short lines count as boilerplate; a long paragraph quoted on many pages
+    is content. Sites with fewer than BOILERPLATE_MIN_PAGES pages are left alone.
+    """
+    if len(pages) < BOILERPLATE_MIN_PAGES:
+        return pages
+    seen: dict[str, int] = {}
+    for p in pages:
+        for line in {ln.strip() for ln in p.text.splitlines() if ln.strip()}:
+            seen[line] = seen.get(line, 0) + 1
+    threshold = max(BOILERPLATE_MIN_PAGES, BOILERPLATE_SHARE * len(pages))
+    chrome = {ln for ln, n in seen.items() if n >= threshold and len(ln) <= 200}
+    for p in pages[1:]:
+        p.text = "\n".join(ln for ln in p.text.splitlines() if ln.strip() not in chrome)
+    return pages
 
 
 def parse_sitemap(xml_text: str) -> tuple[list[str], list[str]]:
@@ -369,7 +395,7 @@ class Crawler:
             pages.append(page)
             for link in page.links:
                 push(link, depth + 1)
-        return pages
+        return strip_boilerplate(pages)
 
     def _accept(
         self, resp: httpx.Response, url: str, *, depth: int, root_host: str, recorded: set[str]

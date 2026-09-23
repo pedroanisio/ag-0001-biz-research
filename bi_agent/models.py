@@ -162,7 +162,11 @@ class EvidenceLedger:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, list):
             raise ValueError("evidence file must contain a list")
-        return cls([Evidence.model_validate(x) for x in raw])
+        items = [Evidence.model_validate(x) for x in raw]
+        for e in items:  # re-check labels saved under older, looser rules
+            if e.source_kind is not None:
+                e.source_kind = plausible_source_kind(e.source_kind, e.url, e.source_type is SourceType.FIRST_PARTY)
+        return cls(items)
 
 
 def _host(url: str) -> str:
@@ -728,6 +732,14 @@ _OFFICIAL_HOST = re.compile(
 )
 
 
+# News, press and blog sections of official hosts publish announcements, not records.
+_NEWS_PATH = re.compile(
+    r"/(noticias?|news|imprensa|press|press-releases?|actualites|nachrichten|aktuelles|pressemitteilungen"
+    r"|prensa|comunicados?|blog|artigos?|articles?)(/|$|-|\?)",
+    re.IGNORECASE,
+)
+
+
 def plausible_source_kind(kind: SourceKind, url: str, on_site: bool) -> SourceKind:
     """Lower a source kind the URL cannot back up.
 
@@ -739,4 +751,6 @@ def plausible_source_kind(kind: SourceKind, url: str, on_site: bool) -> SourceKi
         return kind if kind in {SourceKind.COMPANY_FILING, SourceKind.INVESTOR_DISCLOSURE} else SourceKind.OFFICIAL_COMPANY
     if kind in PRIMARY_RECORD_KINDS and not _OFFICIAL_HOST.search(_host(url)):
         return SourceKind.DATABASE_AGGREGATOR  # e.g. a CNPJ lookup site that copies the registry
+    if kind in PRIMARY_RECORD_KINDS and _NEWS_PATH.search(re.sub(r"^https?://[^/]+", "", url)):
+        return SourceKind.NEWS  # e.g. a state government's press release about the company
     return kind

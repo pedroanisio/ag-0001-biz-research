@@ -148,3 +148,26 @@ def test_extract_flags_javascript_app_shells():
     assert many_scripts.js_rendered
     rendered = extract("https://a.test/", "<html><body><div id='root'>" + "Real content. " * 40 + "</div><script></script></body></html>")
     assert not rendered.js_rendered
+
+
+
+def test_extract_keeps_menu_links_but_drops_menu_text():
+    page = extract("https://a.test/", "<html><body><nav><a href='/sobre'>Quem somos</a></nav>"
+                                      "<div role='navigation'><a href='/precos'>Preços</a></div><p>Gás natural.</p></body></html>")
+    assert "https://a.test/sobre" in page.links and "https://a.test/precos" in page.links
+    assert "Quem somos" not in page.text and "Preços" not in page.text and "Gás natural." in page.text
+
+
+def test_strip_boilerplate_keeps_the_home_copy_and_long_lines():
+    from bi_agent.crawler import Page, strip_boilerplate
+
+    footer = "PBGÁS · CNPJ 00.000.000/0001-00 · 0800 281 0197"
+    quote = "x" * 250
+    pages = [Page(url=f"https://a.test/{i}", status=200, title="", description="",
+                  text=f"{footer}\nContent of page {i}\n{quote}") for i in range(5)]
+    strip_boilerplate(pages)
+    assert footer in pages[0].text  # the home page keeps it once
+    assert all(footer not in p.text and f"Content of page {i}" in p.text for i, p in enumerate(pages) if i)
+    assert all(quote in p.text for p in pages)  # long repeated text is content, not chrome
+    few = [Page(url="u", status=200, title="", description="", text=footer) for _ in range(3)]
+    assert all(p.text == footer for p in strip_boilerplate(few))

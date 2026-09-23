@@ -3,8 +3,10 @@
 The PDF is a second rendering of ``report.md``, not a second report: it reads the Markdown that
 :mod:`bi_agent.report` produced (a small, known subset: headings, paragraphs, bullets, pipe
 tables, block quotes, bold and italic) and lays it out with a cover page, a table of contents,
-PDF bookmarks, running header and footer, colour-coded classification labels and citations that
-link to their row in the Sources table. It adds no content of its own beyond the page chrome.
+PDF bookmarks, a running header naming the current section, classification tags and citation
+groups that link to their row in the Sources table. Tables too wide for the page (offerings,
+competitors) are set as one card per row. The cover repeats headline facts from the Company
+Snapshot and counts the report's own classification labels; nothing else is added.
 
 The built-in Helvetica family covers the Latin-1 / cp1252 range, which is every character the
 five report languages need; anything outside it is transliterated or replaced.
@@ -64,6 +66,16 @@ CLASS_COLORS: dict[str, str] = {
     "unknown": "#7B8794",
 }
 
+# The same hue mixed with white, as the background of a classification tag.
+CLASS_TINTS: dict[str, str] = {
+    "verified_fact": "#E3F1E8",
+    "company_claim": "#E4ECF6",
+    "third_party_claim": "#EFE7F6",
+    "analytical_inference": "#F8EBDD",
+    "unknown": "#EDEFF2",
+}
+CHIP_BG = "#EDEFF2"
+
 PAGE_W, PAGE_H = A4
 MARGIN_X = 18 * mm
 MARGIN_TOP = 22 * mm
@@ -101,6 +113,15 @@ def _styles() -> dict[str, ParagraphStyle]:
                                       textColor=colors.white),
         "cover_meta": ParagraphStyle("cover_meta", parent=base, fontSize=10, leading=15, textColor=INK),
         "cover_key": ParagraphStyle("cover_key", parent=base, fontSize=8.5, leading=12, textColor=MUTED),
+        "cover_section": ParagraphStyle("cover_section", parent=base, fontName=BOLD, fontSize=8, leading=11,
+                                        textColor=ACCENT, spaceBefore=0, spaceAfter=3),
+        "fact_label": ParagraphStyle("fact_label", parent=base, fontName=BOLD, fontSize=7.5, leading=10,
+                                     textColor=MUTED, spaceAfter=0),
+        "fact": ParagraphStyle("fact", parent=base, fontSize=8.5, leading=11.5, spaceAfter=0),
+        "card_title": ParagraphStyle("card_title", parent=base, fontSize=9.5, leading=13, textColor=INK, spaceAfter=0),
+        "card_label": ParagraphStyle("card_label", parent=base, fontName=BOLD, fontSize=7.5, leading=10.2,
+                                     textColor=MUTED, spaceAfter=0),
+        "caption": ParagraphStyle("caption", parent=base, fontSize=8, leading=11, textColor=MUTED, spaceAfter=4),
     }
 
 
@@ -128,7 +149,13 @@ def _encodable(text: str) -> str:
     return "".join(out)
 
 
+def _nobreak(text: str) -> str:
+    """Escaped text that never wraps inside (a tag reads as one unit)."""
+    return escape(_encodable(text)).replace(" ", "&nbsp;")
+
+
 _CITE = re.compile(r"\[(E\d{3,})\]")
+_CITE_RUN = re.compile(r"\[E\d{3,}\](?:\s*\[E\d{3,}\])*")  # "[E001][E003] [E061]" is one citation group
 _BOLD = re.compile(r"\*\*(.+?)\*\*")
 _CLASS = re.compile(r"\*\(([^()*]+)\)\*")
 _ITALIC = re.compile(r"(?<![\w*])[*_]([^*_\n]+?)[*_](?![\w*])")
@@ -156,11 +183,25 @@ class Inline:
         s = _ITALIC.sub(r"<i>\1</i>", s)
         s = re.sub("\x00(\\d+)\x00", lambda m: self._url(urls[int(m.group(1))], links), s)
         s = s.replace("\n", "<br/>")
-        return _CITE.sub(self._cite, s)
+        return _CITE_RUN.sub(self._cites, s)
 
-    def _cite(self, m: re.Match) -> str:
-        tag = f'<font size="-1">[{m.group(1)}]</font>'
-        return f'<a href="#{m.group(1)}" color="#1D4E89">{tag}</a>' if m.group(1) in self.targets else tag
+    def _cites(self, m: re.Match) -> str:
+        """One compact bracket per run of citations, each id linked to its Sources row."""
+        ids = sorted(dict.fromkeys(_CITE.findall(m.group(0))), key=lambda i: int(i[1:]))
+        linked = [f'<a href="#{i}" color="#1D4E89">{i}</a>' if i in self.targets else i for i in ids]
+        return f'<font size="-1.5" color="#616E7C">[{", ".join(linked)}]</font>'
+
+    def tag(self, key: str, label: str) -> str:
+        """A classification as a small tinted tag."""
+        return (f'<span backColor="{CLASS_TINTS[key]}" color="{CLASS_COLORS[key]}"><font size="-2.5">'
+                f'<b>&nbsp;{_nobreak(label.upper())}&nbsp;</b></font></span>')
+
+    def basis(self, text: str) -> str:
+        """A table "Basis" cell ("Company claim [E001] [E002]") as a tag plus its citations."""
+        for label, key in sorted(self.class_by_label.items(), key=lambda kv: -len(kv[0])):
+            if text.lower().startswith(label):
+                return self.tag(key, text[:len(label)]) + " " + self(text[len(label):].strip())
+        return self(text)
 
     @staticmethod
     def _url(url: str, link: bool) -> str:
@@ -170,7 +211,7 @@ class Inline:
         key = self.class_by_label.get(m.group(1).strip().lower())
         if key is None:
             return f"<i>({m.group(1)})</i>"
-        return f'<font color="{CLASS_COLORS[key]}" size="-1"><b>{m.group(1)}</b></font>'
+        return self.tag(key, m.group(1).strip())
 
 
 # --------------------------------------------------------------------------- markdown blocks
@@ -264,6 +305,10 @@ class SectionHeading(Paragraph):
         self.plain = re.sub(r"<[^>]+>", "", text)
 
     def draw(self) -> None:
+        # The running header shows the first section that starts on a page, else the one carried over.
+        self.canv._bi_last = self.plain
+        if not getattr(self.canv, "_bi_set", False):
+            self.canv._bi_section, self.canv._bi_set = self.plain, True
         self.canv.bookmarkPage(self.key)
         self.canv.addOutlineEntry(self.plain, self.key, level=0, closed=False)
         # A rule under the heading, full body width.
@@ -307,6 +352,7 @@ def _numbered_canvas(page_label: str, header: str):
 
         def showPage(self) -> None:  # noqa: N802 - reportlab API
             self._saved.append(dict(self.__dict__))
+            self._bi_section, self._bi_set = getattr(self, "_bi_last", ""), False  # carried to the next page
             self._startPage()
 
         def save(self) -> None:
@@ -314,15 +360,18 @@ def _numbered_canvas(page_label: str, header: str):
             for state in self._saved:
                 self.__dict__.update(state)
                 if self._pageNumber > 1:
-                    self._chrome(total)
+                    self._chrome(total, state.get("_bi_section", ""))
                 super().showPage()
             super().save()
 
-        def _chrome(self, total: int) -> None:
+        def _chrome(self, total: int, section: str) -> None:
             self.saveState()
             self.setFont(FONT, 7.5)
             self.setFillColor(MUTED)
             self.drawString(MARGIN_X, PAGE_H - 12 * mm, header)
+            if section:
+                self.drawRightString(PAGE_W - MARGIN_X, PAGE_H - 12 * mm,
+                                     section if len(section) <= 60 else section[:57] + "...")
             self.setStrokeColor(RULE)
             self.setLineWidth(0.5)
             self.line(MARGIN_X, PAGE_H - 13.8 * mm, PAGE_W - MARGIN_X, PAGE_H - 13.8 * mm)
@@ -410,10 +459,148 @@ def _table(block: Block, st: dict[str, ParagraphStyle], inline: Inline, anchors:
     return table
 
 
+# --------------------------------------------------------------------------- cards, sources, cover data
+
+
+def _chip(text: str) -> str:
+    return (f'<span backColor="{CHIP_BG}" color="#3E4C59"><font size="-2.5">&nbsp;{_nobreak(text)}'
+            f'&nbsp;</font></span>')
+
+
+def _column(rows: list[list[str]], t: Translator, key: str) -> int | None:
+    header = [h.strip().lower() for h in rows[0]]
+    label = t(key).lower()
+    return header.index(label) if label in header else None
+
+
+def _cards(block: Block, st: dict[str, ParagraphStyle], inline: Inline, t: Translator) -> list[Flowable]:
+    """A wide table (offerings, competitors) as one card per row: the first column is the card's
+    title, type/category and basis become tags beside it, every other column a labelled line.
+    Eight narrow columns cannot hold sentences without breaking words; a card can."""
+    head = block.rows[0]
+    chips = [c for c in (_column(block.rows, t, "type"), _column(block.rows, t, "category")) if c is not None]
+    basis = _column(block.rows, t, "basis")
+    out: list[Flowable] = []
+    for row in block.rows[1:]:
+        row = row + [""] * (len(head) - len(row))
+        if row[0].strip() in ("", "—"):  # the "nothing found" placeholder row
+            out.append(Paragraph(f"<i>{inline(row[-1])}</i>", st["body"]))
+            continue
+        tags = "&nbsp;".join(_chip(row[c]) for c in chips if row[c].strip() not in ("", "—"))
+        title = f"<b>{inline(row[0], links=False)}</b>"
+        if tags:
+            title += "&nbsp;&nbsp;" + tags
+        if basis is not None and row[basis].strip():
+            title += "&nbsp;&nbsp;" + inline.basis(row[basis])
+        data: list[list] = [[Paragraph(title, st["card_title"]), ""]]
+        for c, name in enumerate(head):
+            if c == 0 or c in chips or c == basis or not row[c].strip():
+                continue
+            data.append([Paragraph(inline(name, links=False), st["card_label"]), Paragraph(inline(row[c]), st["cell"])])
+        card = Table(data, colWidths=[BODY_W * 0.22, BODY_W * 0.78], hAlign="LEFT")
+        card.setStyle(TableStyle([
+            ("SPAN", (0, 0), (1, 0)), ("BACKGROUND", (0, 0), (-1, 0), ACCENT_SOFT),
+            ("BOX", (0, 0), (-1, -1), 0.5, RULE), ("LINEBELOW", (0, 0), (-1, -2), 0.3, RULE),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        out += [KeepTogether([card]), Spacer(1, 6)]
+    return out
+
+
+def _lean_sources(block: Block, t: Translator) -> tuple[Block, str | None]:
+    """The Sources table without columns that say nothing: Published when no row has a date,
+    Accessed when every row has the same date (said once in a caption instead), and Type folded
+    into Source kind ("news · third party")."""
+    rows = [r[:] for r in block.rows]
+    caption = None
+    drop: set[int] = set()
+    published = _column(rows, t, "published")
+    if published is not None and all(r[published].strip() in ("", t("n_a")) for r in rows[1:]):
+        drop.add(published)
+    accessed = _column(rows, t, "accessed")
+    if accessed is not None and rows[1:] and len({r[accessed] for r in rows[1:]}) == 1:
+        drop.add(accessed)
+        caption = t("accessed_all", date=rows[1][accessed])
+    kind, kind_of = _column(rows, t, "type"), _column(rows, t, "source_kind")
+    if kind is not None and kind_of is not None:
+        for r in rows[1:]:
+            r[kind_of] = f"{r[kind_of]} · {r[kind]}" if r[kind_of].strip() not in ("", "—") else r[kind]
+        drop.add(kind)
+    return Block("table", rows=[[c for i, c in enumerate(r) if i not in drop] for r in rows]), caption
+
+
+_STRIP = re.compile(r"\*\([^()*]+\)\*|\[E\d{3,}\]|\*\*")
+
+
+def _plain(text: str, limit: int = 150) -> str:
+    text = " ".join(_STRIP.sub("", text.replace("\\|", "|")).split())
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def _key_facts(blocks: list[Block], t: Translator) -> list[tuple[str, str]]:
+    """Headline facts for the cover, taken from the Company Snapshot table."""
+    heading = f"2. {t('s2')}"
+    at = next((i for i, b in enumerate(blocks) if b.kind == "h1" and b.text == heading), None)
+    table = next((b for b in blocks[at:] if b.kind == "table"), None) if at is not None else None
+    if table is None:
+        return []
+    values = {r[0].strip(): r[1] for r in table.rows[1:] if len(r) > 1}
+    facts = []
+    for key in ("website_subject", "headquarters", "founded", "ownership", "industry", "business_model"):
+        value = values.get(t(key), "")
+        if value and value.strip() != t("unknown"):
+            facts.append((t(key), _plain(value)))
+    return facts
+
+
+def _evidence_counts(blocks: list[Block], inline: Inline) -> dict[str, int]:
+    """How many claims in the report carry each classification (inline tags and Basis cells)."""
+    counts = dict.fromkeys(CLASS_COLORS, 0)
+    labels = sorted(inline.class_by_label.items(), key=lambda kv: -len(kv[0]))
+    texts = [b.text for b in blocks] + [x for b in blocks for x in b.items]
+    cells = [c for b in blocks if b.kind == "table" for r in b.rows[1:] for c in r]
+    for text in texts + cells:
+        for m in _CLASS.finditer(text):
+            key = inline.class_by_label.get(m.group(1).strip().lower())
+            if key:
+                counts[key] += 1
+    for cell in cells:
+        low = cell.strip().lower()
+        key = next((k for label, k in labels if low.startswith(label) and "[e" in low), None)
+        if key:
+            counts[key] += 1
+    return counts
+
+
+class EvidenceBar(Flowable):
+    """A stacked bar: the share of the report's claims in each classification."""
+
+    def __init__(self, counts: dict[str, int], width: float, height: float = 4.5 * mm) -> None:
+        super().__init__()
+        self.counts, self.width, self.height = counts, width, height
+
+    def wrap(self, *_args):
+        return self.width, self.height
+
+    def draw(self) -> None:
+        total = sum(self.counts.values()) or 1
+        x = 0.0
+        for key, n in self.counts.items():
+            w = self.width * n / total
+            if w <= 0:
+                continue
+            self.canv.setFillColor(colors.HexColor(CLASS_COLORS[key]))
+            self.canv.rect(x, 0, w, self.height, stroke=0, fill=1)
+            x += w
+
+
 # --------------------------------------------------------------------------- document
 
 
-def _cover(blocks: list[Block], st: dict[str, ParagraphStyle], inline: Inline, t: Translator) -> list[Flowable]:
+def _cover(blocks: list[Block], st: dict[str, ParagraphStyle], inline: Inline, t: Translator,
+           facts: list[tuple[str, str]] | None = None, counts: dict[str, int] | None = None) -> list[Flowable]:
     title = next((b.text for b in blocks if b.kind == "title"), t("title", name=""))
     kicker, _, company = title.partition(":")
     story: list[Flowable] = [Spacer(1, PAGE_H * 0.14)]
@@ -422,17 +609,34 @@ def _cover(blocks: list[Block], st: dict[str, ParagraphStyle], inline: Inline, t
                   Paragraph(escape(_encodable(company.strip())), st["cover_title"])]
     else:
         story.append(Paragraph(escape(_encodable(title)), st["cover_title"]))
-    story.append(Spacer(1, PAGE_H * 0.26))
+    story.append(Spacer(1, PAGE_H * (0.2 if facts else 0.26)))
     for b in blocks:
         if b.kind == "para":
             story.append(Paragraph(inline(b.text), st["cover_meta"] if "\n" in b.text else st["cover_key"]))
             story.append(Spacer(1, 3 * mm))
         elif b.kind == "quote":
             story.append(_note(b.text, st, inline))
+    width = BODY_W - 12 * mm
+    if facts:
+        rows = [[Paragraph(escape(_encodable(k.upper())), st["fact_label"]), Paragraph(escape(_encodable(v)), st["fact"])]
+                for k, v in facts]
+        panel = Table(rows, colWidths=[width * 0.26, width * 0.74], hAlign="LEFT")
+        panel.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LINEBELOW", (0, 0), (-1, -2), 0.3, RULE),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story += [Spacer(1, 3 * mm), Paragraph(escape(_encodable(t("key_facts").upper())), st["cover_section"]),
+                  panel, Spacer(1, 5 * mm)]
+    total = sum((counts or {}).values())
+    if total:
+        story += [Paragraph(escape(_encodable(t("evidence_profile", n=total).upper())), st["cover_section"]),
+                  EvidenceBar(counts, width), Spacer(1, 2 * mm)]
     legend = "&nbsp;&nbsp;&nbsp;&nbsp;".join(
-        f'<font color="{CLASS_COLORS[k]}" size="11">&#9632;</font>&nbsp;{escape(_encodable(t(k)))}'
+        f'<font color="{CLASS_COLORS[k]}" size="11">&#9632;</font>&nbsp;{_nobreak(t(k))}'
+        + (f"&nbsp;<b>{counts[k]}</b>" if total else "")
         for k in CLASS_COLORS)
-    story += [Spacer(1, 2 * mm), Paragraph(legend, st["cover_key"])]
+    story += [Spacer(1, 1 * mm), Paragraph(legend, st["cover_key"])]
     return story
 
 
@@ -458,7 +662,8 @@ def build_story(md: str, lang: str) -> tuple[list[Flowable], str]:
                if r and re.fullmatch(r"E\d{3,}", r[0])} if at is not None else set()
     inline = Inline(t, targets)
 
-    story: list[Flowable] = _cover(blocks[:first_section], st, inline, t)
+    story: list[Flowable] = _cover(blocks[:first_section], st, inline, t,
+                                   facts=_key_facts(blocks, t), counts=_evidence_counts(blocks[first_section:], inline))
     story += [NextPageTemplate("body"), PageBreak()]
     toc = TableOfContents(levelStyles=[st["toc1"]], dotsMinLevel=0)
     story += [Paragraph(escape(_encodable(t("contents"))), st["toc_title"]), toc, PageBreak()]
@@ -485,7 +690,17 @@ def build_story(md: str, lang: str) -> tuple[list[Flowable], str]:
                 bulletOffsetY=-1)
         elif b.kind == "quote":
             flow = _note(b.text, st, inline)
+        elif b.kind == "table" and b.rows and not in_sources and max(len(r) for r in b.rows) >= 7:
+            if pending_label is not None:
+                story.append(pending_label)
+                pending_label = None
+            story += _cards(b, st, inline, t)
+            continue
         elif b.kind == "table" and b.rows:
+            if in_sources:
+                b, caption = _lean_sources(b, t)
+                if caption:
+                    story.append(Paragraph(escape(_encodable(caption)), st["caption"]))
             flow = _table(b, st, inline, anchors=in_sources)
         else:
             continue
