@@ -76,7 +76,7 @@ def test_researched_collects_hits_and_result():
     assert hits == [SearchHit("https://a.test/1", "Title of https://a.test/1", "2025-01-01"),
                     SearchHit("https://b.test/2", "Title of https://b.test/2", "2025-01-01")]
     tools = client.messages.calls[0]["tools"]
-    assert tools[0]["type"] == "web_search_20250305" and tools[0]["max_uses"] == 3
+    assert tools[0]["type"] == "web_search_20260209" and tools[0]["max_uses"] == 3
     assert tools[0]["allowed_domains"] == ["a.test"]
     assert "tool_choice" not in client.messages.calls[0]
 
@@ -122,4 +122,60 @@ def test_block_to_dict_handles_dicts_models_and_namespaces():
     assert _block_to_dict({"a": 1}) == {"a": 1}
     assert _block_to_dict(B()) == {"type": "text", "text": "hi"}
     assert _block_to_dict(text_block("x")) == {"type": "text", "text": "x"}
-    assert '"name": "a"' in pretty(Out(name="a", count=1))
+    assert pretty(Out(name="a", count=1)) == '{"name":"a","count":1}'
+
+
+def test_search_tool_version_follows_model():
+    from bi_agent.llm import search_tool_type
+
+    assert search_tool_type("claude-sonnet-5") == "web_search_20260209"
+    assert search_tool_type("claude-opus-4-8") == "web_search_20260209"
+    for old in ("claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1", "claude-sonnet-4-0"):
+        assert search_tool_type(old) == "web_search_20250305", old
+
+
+def test_usage_is_recorded_and_priced():
+    from types import SimpleNamespace
+
+    usage = SimpleNamespace(input_tokens=1000, output_tokens=500, cache_creation_input_tokens=2000,
+                            cache_read_input_tokens=10_000, server_tool_use=SimpleNamespace(web_search_requests=3))
+    reply = SimpleNamespace(content=[tool_use("submit", {"name": "a", "count": 1})], stop_reason="tool_use", usage=usage)
+    llm = LLM(scripted([reply]), model="claude-sonnet-5")
+    llm.structured(system="s", user="u", schema=Out)
+    total = llm.usage.summary()
+    assert total["calls"] == 1 and total["cache_read_input_tokens"] == 10_000 and total["web_search_requests"] == 3
+    # 1000*2 + 2000*2.5 + 10000*0.2 + 500*10 per million, plus 3 searches at $0.01
+    assert total["estimated_cost_usd"] == round((2000 + 5000 + 2000 + 5000) / 1e6 + 0.03, 4)
+    assert LLM(object(), model="unknown-model").usage.summary()["estimated_cost_usd"] == 0
+
+
+def test_unknown_model_has_no_cost_estimate():
+    from bi_agent.llm import Usage, UsageLog
+
+    assert UsageLog("x", [Usage("a", input_tokens=5)]).summary()["estimated_cost_usd"] is None
+
+
+def test_truncated_response_fails_at_once_without_retry():
+    client = scripted([response(tool_use("submit", {"name": "a"}), stop_reason="max_tokens")] * 3)
+    llm = LLM(client, model="m", max_tokens=100, max_attempts=3)
+    with pytest.raises(LLMOutputError, match="cut off at max_tokens=100; re-run with a higher --max-tokens"):
+        llm.structured(system="s", user="u", schema=Out)
+    assert llm.calls == 1 and llm.usage.calls[0].stop_reason == "max_tokens"
+
+
+def test_is_transient_classifies_errors():
+    import anthropic
+    import httpx
+
+    from bi_agent.llm import is_transient
+
+    req = httpx.Request("POST", "https://x.test")
+
+    def status(code):
+        return anthropic.APIStatusError("e", response=httpx.Response(code, request=req), body=None)
+
+    assert is_transient(status(429)) and is_transient(status(529))
+    assert not is_transient(status(400)) and not is_transient(status(401))
+    assert is_transient(anthropic.APIConnectionError(request=req))
+    assert is_transient(LLMOutputError("x", []))
+    assert not is_transient(RuntimeError("bug"))

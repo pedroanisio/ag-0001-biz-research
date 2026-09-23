@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Sequence
 
+import anthropic
 import httpx
 
 from . import pipeline
@@ -35,7 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="run directory (created if missing)")
     p.add_argument("--model", default=os.environ.get("BI_AGENT_MODEL", DEFAULT_MODEL))
     p.add_argument("--max-pages", type=int, default=60)
-    p.add_argument("--max-search-uses", type=int, default=8, help="web_search calls per research topic")
+    p.add_argument("--max-tokens", type=int, default=64_000, help="output token limit per model response")
+    p.add_argument("--max-search-uses", type=int, default=10, help="web_search calls per research topic group")
     p.add_argument("--delay", type=float, default=0.5, help="seconds between page fetches")
     p.add_argument("--lang", choices=SUPPORTED, default=None,
                    help="report language (default: the website's language, detected at crawl)")
@@ -52,11 +54,23 @@ def build_parser() -> argparse.ArgumentParser:
 def make_llm(args: argparse.Namespace, client_factory: Callable[[], object] = build_client) -> LLM:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise BiAgentError("ANTHROPIC_API_KEY is not set; the LLM stages cannot run")
-    return LLM(client_factory(), model=args.model, max_search_uses=args.max_search_uses)
+    return LLM(client_factory(), model=args.model, max_search_uses=args.max_search_uses, max_tokens=args.max_tokens)
 
 
 def make_crawler(args: argparse.Namespace, http_client: httpx.Client | None = None) -> Crawler:
     return Crawler(http_client or httpx.Client(), max_pages=args.max_pages, delay_seconds=args.delay)
+
+
+def _print_usage(store: pipeline.RunStore) -> None:
+    if not store.exists("usage.json"):
+        return
+    total = store.load_json("usage.json").get("total", {})
+    cost = total.get("estimated_cost_usd")
+    print(f"API usage so far: {total.get('calls', 0)} calls, {total.get('input_tokens', 0)} input + "
+          f"{total.get('cache_read_input_tokens', 0)} cached + {total.get('cache_creation_input_tokens', 0)} "
+          f"cache-write tokens, {total.get('output_tokens', 0)} output tokens, "
+          f"{total.get('web_search_requests', 0)} searches"
+          + (f", ~${cost:.2f}" if cost is not None else "") + f" (details in {store.path('usage.json')})")
 
 
 def main(
@@ -98,6 +112,15 @@ def main(
         else:
             md = pipeline.stage_report(store)
             print(f"report written to {store.path('report.md')} ({len(md)} chars)")
+        if llm is not None:
+            _print_usage(store)
+    except anthropic.APIStatusError as exc:
+        _print_usage(store)
+        message = exc.body.get("error", {}).get("message") if isinstance(exc.body, dict) else None
+        print(f"error: Anthropic API returned {exc.status_code}: {message or exc}", file=sys.stderr)
+        print(f"  finished stages are saved in {store.dir}; re-run the failed stage and the ones after it",
+              file=sys.stderr)
+        return 3
     except BiAgentError as exc:
         print(f"error: {exc}", file=sys.stderr)
         for e in getattr(exc, "errors", [])[:20]:

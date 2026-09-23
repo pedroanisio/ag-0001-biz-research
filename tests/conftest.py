@@ -94,6 +94,23 @@ class FakeMessages:
         self.calls.append(kwargs)
         return self.handler(kwargs)
 
+    def stream(self, **kwargs: Any) -> "FakeStream":
+        return FakeStream(self.create(**kwargs))
+
+
+class FakeStream:
+    def __init__(self, message: Any) -> None:
+        self.message = message
+
+    def __enter__(self) -> "FakeStream":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    def get_final_message(self) -> Any:
+        return self.message
+
 
 class FakeClient:
     def __init__(self, handler: Callable[[dict], Any]) -> None:
@@ -231,7 +248,8 @@ def stage_router(overrides: dict[str, Callable[[dict], Any]] | None = None) -> F
     overrides = overrides or {}
 
     def handler(kwargs: dict) -> Any:
-        names = [t["name"] for t in kwargs.get("tools", [])]
+        forced = (kwargs.get("tool_choice") or {}).get("name")
+        names = [forced] if forced else [t["name"] for t in kwargs.get("tools", [])]
         for n in names:
             if n in overrides:
                 return overrides[n](kwargs)

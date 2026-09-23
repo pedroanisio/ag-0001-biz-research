@@ -148,3 +148,33 @@ def test_narrative_executive_summary_bounds():
     with pytest.raises(ValidationError):
         Narrative.model_validate(p)
     assert len(Narrative.model_validate(narrative_payload()).executive_summary) == 5
+
+
+def test_repair_refs_drops_unknown_ids_and_lowers_classifications():
+    from bi_agent.models import repair_refs
+
+    ledger = EvidenceLedger()
+    first = ledger.add(source_type=SourceType.FIRST_PARTY, url="https://a.test/", title="t", publisher="p",
+                       excerpt="e", retrieved_at="r").id
+    third = ledger.add(source_type=SourceType.THIRD_PARTY, url="https://n.test/", title="t", publisher="p",
+                       excerpt="e", retrieved_at="r").id
+    payload = {
+        "a": {"classification": "verified_fact", "evidence_ids": [first, "E999"], "statement": f"x [{first}] [E999]."},
+        "b": {"classification": "company_claim", "evidence_ids": [third]},
+        "c": {"classification": "third_party_claim", "evidence_ids": [first]},
+        "d": {"classification": "company_claim", "evidence_ids": ["E998"]},
+        "e": {"value": None, "classification": "company_claim", "evidence_ids": ["E997"]},
+        "f": {"classification": "verified_fact", "evidence_ids": [third]},
+        "g": {"classification": "unknown", "evidence_ids": []},
+        "n": 3,
+    }
+    fixed, notes = repair_refs(payload, ledger)
+    assert fixed["a"] == {"classification": "company_claim", "evidence_ids": [first], "statement": f"x [{first}]."}
+    assert fixed["b"]["classification"] == "third_party_claim"
+    assert fixed["c"]["classification"] == "company_claim"
+    assert fixed["d"] == {"classification": "analytical_inference", "evidence_ids": []}
+    assert fixed["e"]["classification"] == "unknown"
+    assert fixed["f"]["classification"] == "verified_fact" and fixed["g"]["classification"] == "unknown"
+    assert fixed["n"] == 3
+    assert any("E999" in n for n in notes) and any("citation [E999]" in n for n in notes)
+    assert repair_refs({"s": "clean [E001]"}, EvidenceLedger())[1] == ["$.s: removed unknown citation [E001]"]

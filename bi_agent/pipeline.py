@@ -12,15 +12,18 @@ Run directory layout::
     analysis.json   Analysis
     narrative.json  Narrative
     report.md       rendered report
+    usage.json      tokens, web searches and estimated cost per stage
+    research.partial.json  research progress, present only while research is unfinished
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Iterator, TypeVar
 from urllib.parse import urlparse
 
 from pydantic import BaseModel
@@ -29,7 +32,7 @@ from . import prompts
 from .crawler import Crawler, Page, canonical, registrable_host, same_site
 from .errors import StageError
 from .i18n import DEFAULT_LANG, SUPPORTED, detect_site_lang, normalize_lang
-from .llm import LLM, SearchHit, pretty
+from .llm import LLM, SearchHit, is_transient, pretty
 from .models import (
     Analysis,
     Classification,
@@ -43,6 +46,7 @@ from .models import (
     SourceType,
     check_refs,
     normalize_url,
+    repair_refs,
     semantic_errors,
 )
 from .report import render_report
@@ -52,6 +56,7 @@ T = TypeVar("T", bound=BaseModel)
 
 PAGE_CHARS_FOR_LLM = 6_000
 TOTAL_CHARS_FOR_LLM = 260_000
+IDENTIFY_CHARS_FOR_LLM = 120_000  # identify reads the highest-priority pages only
 
 
 def now_iso() -> str:
@@ -113,6 +118,33 @@ class RunStore:
         self.save_json("run.json", meta)
 
 
+@contextmanager
+def metered(store: RunStore, llm: LLM, stage: str) -> Iterator[None]:
+    """Record the API usage of one stage in usage.json, also when the stage fails."""
+    start = len(llm.usage.calls)
+    try:
+        yield
+    finally:
+        calls = llm.usage.calls[start:]
+        if calls:
+            data = store.load_json("usage.json") if store.exists("usage.json") else {"stages": {}}
+            stage_log = type(llm.usage)(llm.model, calls)
+            data["model"] = llm.model
+            data["stages"][stage] = stage_log.summary()
+            data["stages"][stage]["per_call"] = [c.__dict__ for c in calls]
+            totals: dict[str, Any] = {}
+            for summary in data["stages"].values():
+                for k, v in summary.items():
+                    if k == "per_call":
+                        continue
+                    if v is None or totals.get(k, 0) is None:
+                        totals[k] = None
+                    else:
+                        totals[k] = round(totals.get(k, 0) + v, 4)
+            data["total"] = totals
+            store.save_json("usage.json", data)
+
+
 # --------------------------------------------------------------------------- stage: crawl
 
 
@@ -137,6 +169,44 @@ def stage_crawl(store: RunStore, url: str, crawler: Crawler, lang: str | None = 
 
 
 def _pages_block(store: RunStore, ledger: EvidenceLedger, budget: int = TOTAL_CHARS_FOR_LLM) -> str:
+    return "".join(_page_chunks(store, ledger, budget))
+
+
+def _pages_split(store: RunStore, ledger: EvidenceLedger) -> tuple[str, str]:
+    """(highest-priority pages up to the identify budget, the remaining pages up to the total budget)."""
+    head: list[str] = []
+    tail: list[str] = []
+    used = 0
+    for chunk in _page_chunks(store, ledger, TOTAL_CHARS_FOR_LLM):
+        (head if not tail and used + len(chunk) <= IDENTIFY_CHARS_FOR_LLM else tail).append(chunk)
+        used += len(chunk)
+    return "".join(head), "".join(tail)
+
+
+def _site_system(store: RunStore, ledger: EvidenceLedger) -> tuple[list[dict], str]:
+    """System prompt shared by identify and signals, and the pages only signals reads.
+
+    The pages live in the system prompt, marked for caching, because the two calls force
+    different tools and a ``tool_choice`` change invalidates the cached messages but not the
+    cached system prompt. Both calls also declare the same two tools (see ``SITE_TOOLS``).
+    """
+    head, tail = _pages_split(store, ledger)
+    meta = store.meta()
+    system = [
+        {"type": "text", "text": prompts.localized(prompts.ANALYST_ROLE, store.lang())},
+        {"type": "text", "cache_control": {"type": "ephemeral"},
+         "text": f"Start URL: {meta['url']}\n\nCrawled pages (each with its evidence id):\n{head}"},
+    ]
+    return system, tail
+
+
+SITE_TOOLS = [
+    ("submit_identity", Identity, "Submit the completed, fully populated result."),
+    ("submit_site_signals", SiteSignals, "Submit the completed, fully populated result."),
+]
+
+
+def _page_chunks(store: RunStore, ledger: EvidenceLedger, budget: int) -> list[str]:
     pages = [Page.from_dict(d) for d in store.load_json("pages.json")]
     pages.sort(key=lambda p: -p.score)
     parts: list[str] = []
@@ -154,7 +224,7 @@ def _pages_block(store: RunStore, ledger: EvidenceLedger, budget: int = TOTAL_CH
             break
         parts.append(chunk)
         used += len(chunk)
-    return "".join(parts)
+    return parts
 
 
 # --------------------------------------------------------------------------- stage: identify
@@ -162,12 +232,13 @@ def _pages_block(store: RunStore, ledger: EvidenceLedger, budget: int = TOTAL_CH
 
 def stage_identify(store: RunStore, llm: LLM) -> Identity:
     ledger = store.ledger()
-    meta = store.meta()
-    user = f"Start URL: {meta['url']}\n\nCrawled pages (each with its evidence id):\n{_pages_block(store, ledger, 120_000)}"
-    identity = llm.structured(
-        system=prompts.localized(prompts.IDENTIFY_SYSTEM, store.lang()), user=user, schema=Identity, tool_name="submit_identity",
-        semantic_check=lambda o: semantic_errors(o, ledger),
-    )
+    system, _tail = _site_system(store, ledger)
+    with metered(store, llm, "identify"):
+        identity = llm.structured(
+            system=system, user=prompts.IDENTIFY_TASK, schema=Identity, tool_name="submit_identity",
+            shared_tools=SITE_TOOLS, repair=lambda p: repair_refs(p, ledger),
+            semantic_check=lambda o: semantic_errors(o, ledger),
+        )
     store.save_model("identity.json", identity)
     return identity
 
@@ -178,14 +249,17 @@ def stage_identify(store: RunStore, llm: LLM) -> Identity:
 def stage_signals(store: RunStore, llm: LLM) -> SiteSignals:
     ledger = store.ledger()
     identity = store.load_model("identity.json", Identity)
-    user = (
-        f"Company: {identity.company_name.value or 'unknown'}\n\nCrawled pages (each with its evidence id):\n"
-        f"{_pages_block(store, ledger)}"
-    )
-    signals = llm.structured(
-        system=prompts.localized(prompts.SIGNALS_SYSTEM, store.lang()), user=user, schema=SiteSignals, tool_name="submit_site_signals",
-        semantic_check=lambda o: semantic_errors(o, ledger),
-    )
+    system, tail = _site_system(store, ledger)
+    user = f"Company: {identity.company_name.value or 'unknown'}\n\n"
+    if tail:
+        user += f"More crawled pages (each with its evidence id):\n{tail}\n\n"
+    user += prompts.SIGNALS_TASK
+    with metered(store, llm, "signals"):
+        signals = llm.structured(
+            system=system, user=user, schema=SiteSignals, tool_name="submit_site_signals",
+            shared_tools=SITE_TOOLS, repair=lambda p: repair_refs(p, ledger),
+            semantic_check=lambda o: semantic_errors(o, ledger),
+        )
     store.save_model("signals.json", signals)
     return signals
 
@@ -236,7 +310,20 @@ def verify_findings(
     return accepted, rejected
 
 
-def stage_research(store: RunStore, llm: LLM, topics: dict[str, str] | None = None) -> ExternalFindings:
+RESEARCH_PROGRESS = "research.partial.json"
+
+
+def stage_research(
+    store: RunStore, llm: LLM, groups: dict[str, dict[str, str]] | None = None
+) -> ExternalFindings:
+    """Research each topic group with web_search, checkpointing after every group.
+
+    A group that fails with a transient error (rate limit, server error, network, invalid output)
+    is recorded in not_found and the next group runs. Any other API error (no credit, bad key,
+    unknown model) stops the stage at once: every later call would fail the same way. Progress is
+    saved after each group, so re-running the stage resumes where it stopped instead of paying for
+    finished groups again.
+    """
     ledger = store.ledger()
     identity = store.load_model("identity.json", Identity)
     signals = store.load_model("signals.json", SiteSignals)
@@ -248,26 +335,45 @@ def stage_research(store: RunStore, llm: LLM, topics: dict[str, str] | None = No
     if identity.headquarters.value:
         known_lines.append(f"- headquarters: {identity.headquarters.value}")
     known = "\n".join(known_lines) or "- nothing extracted from the website"
-    all_findings: list[Finding] = []
-    not_found: list[str] = []
-    rejected: list[str] = []
+    groups = groups or prompts.research_groups()
+
+    progress = store.load_json(RESEARCH_PROGRESS) if store.exists(RESEARCH_PROGRESS) else {
+        "done": [], "failed": [], "findings": [], "not_found": [], "rejected": []}
+    if progress["done"]:
+        log.info("resuming research: %s already done", ", ".join(progress["done"]))
     system = prompts.localized(prompts.RESEARCH_SYSTEM, store.lang())
-    for topic, guidance in (topics or prompts.RESEARCH_TOPICS).items():
-        user = prompts.research_user_prompt(company, meta["start"], topic, guidance, known, store.site_lang())
-        try:
-            raw, hits = llm.researched(system=system, user=user, schema=RawFindings)
-        except Exception as exc:  # noqa: BLE001 - one failed topic must not sink the run
-            log.warning("research topic %s failed: %s", topic, exc)
-            not_found.append(f"{topic}: research call failed ({type(exc).__name__})")
-            continue
-        acc, rej = verify_findings(raw, hits, ledger, site_host, now_iso())
-        all_findings.extend(acc)
-        rejected.extend(rej)
-        not_found.extend(f"{topic}: {x}" for x in raw.not_found)
-        log.info("topic %s: %d findings accepted, %d rejected", topic, len(acc), len(rej))
-    result = ExternalFindings(findings=all_findings, not_found=not_found, rejected=rejected)
+    with metered(store, llm, "research"):
+        for group, topics in groups.items():
+            if group in progress["done"]:
+                continue
+            user = prompts.research_user_prompt(
+                company, meta["start"], topics, known, store.site_lang(), llm.max_search_uses)
+            try:
+                raw, hits = llm.researched(system=system, user=user, schema=RawFindings)
+            except Exception as exc:  # noqa: BLE001 - classified below
+                if not is_transient(exc):
+                    raise
+                log.warning("research group %s failed: %s", group, exc)
+                progress["failed"].append(group)
+                progress["not_found"].append(f"{group}: research call failed ({type(exc).__name__})")
+                continue
+            acc, rej = verify_findings(raw, hits, ledger, site_host, now_iso())
+            progress["findings"].extend(f.model_dump(mode="json") for f in acc)
+            progress["rejected"].extend(rej)
+            progress["not_found"].extend(f"{group}: {x}" for x in raw.not_found)
+            progress["done"].append(group)
+            store.save_ledger(ledger)
+            store.save_json(RESEARCH_PROGRESS, progress)
+            log.info("group %s (%s): %d findings accepted, %d rejected", group, ", ".join(topics), len(acc), len(rej))
+    if not any(g in progress["done"] for g in groups):
+        raise StageError("research failed for every topic group; nothing to analyze (re-run the research stage)")
+    result = ExternalFindings(
+        findings=[Finding.model_validate(f) for f in progress["findings"]],
+        not_found=progress["not_found"], rejected=progress["rejected"],
+    )
     store.save_ledger(ledger)
     store.save_model("findings.json", result)
+    store.path(RESEARCH_PROGRESS).unlink(missing_ok=True)
     return result
 
 
@@ -285,10 +391,12 @@ def stage_analyze(store: RunStore, llm: LLM) -> Analysis:
         + "\n\nWEBSITE SIGNALS:\n" + pretty(signals)
         + "\n\nEXTERNAL FINDINGS:\n" + pretty(findings)
     )
-    analysis = llm.structured(
-        system=prompts.localized(prompts.ANALYZE_SYSTEM, store.lang()), user=user, schema=Analysis, tool_name="submit_analysis",
-        semantic_check=lambda o: semantic_errors(o, ledger),
-    )
+    with metered(store, llm, "analyze"):
+        analysis = llm.structured(
+            system=prompts.localized(prompts.ANALYZE_SYSTEM, store.lang()), user=user, schema=Analysis,
+            tool_name="submit_analysis", repair=lambda p: repair_refs(p, ledger),
+            semantic_check=lambda o: semantic_errors(o, ledger),
+        )
     store.save_model("analysis.json", analysis)
     return analysis
 
@@ -307,10 +415,12 @@ def stage_narrate(store: RunStore, llm: LLM) -> Narrative:
         + "\n\nANALYSIS:\n" + pretty(analysis)
         + "\n\nEXTERNAL FINDINGS:\n" + pretty(findings)
     )
-    narrative = llm.structured(
-        system=prompts.localized(prompts.NARRATE_SYSTEM, store.lang()), user=user, schema=Narrative, tool_name="submit_narrative",
-        semantic_check=lambda o: check_refs(o, ledger),
-    )
+    with metered(store, llm, "narrate"):
+        narrative = llm.structured(
+            system=prompts.localized(prompts.NARRATE_SYSTEM, store.lang()), user=user, schema=Narrative,
+            tool_name="submit_narrative", repair=lambda p: repair_refs(p, ledger),
+            semantic_check=lambda o: check_refs(o, ledger),
+        )
     store.save_model("narrative.json", narrative)
     return narrative
 

@@ -96,6 +96,26 @@ def test_verify_findings_fills_title_and_publisher_from_hit():
     assert accepted and ledger.get("E001").title == "Hit title" and ledger.get("E001").publisher == "x.test"
 
 
+GROUPS = {"funding": {"funding": "rounds"}, "news": {"news": "press"}}
+
+
+def _server_error() -> Exception:
+    import anthropic
+    import httpx
+
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    return anthropic.InternalServerError("overloaded", response=httpx.Response(500, request=req), body=None)
+
+
+def _no_credit() -> Exception:
+    import anthropic
+    import httpx
+
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    body = {"type": "error", "error": {"type": "invalid_request_error", "message": "Your credit balance is too low"}}
+    return anthropic.BadRequestError("400", response=httpx.Response(400, request=req, json=body), body=body)
+
+
 def _run_to(store, http_client, stage: str, client=None) -> LLM:
     llm = LLM(client or stage_router(), model="m")
     pipeline.stage_crawl(store, SITE, Crawler(http_client, max_pages=6))
@@ -107,7 +127,7 @@ def _run_to(store, http_client, stage: str, client=None) -> LLM:
     pipeline.stage_signals(store, llm)
     if stage == "signals":
         return llm
-    pipeline.stage_research(store, llm, topics={"funding": "rounds", "news": "press"})
+    pipeline.stage_research(store, llm, groups=GROUPS)
     if stage == "research":
         return llm
     pipeline.stage_analyze(store, llm)
@@ -125,15 +145,27 @@ def test_identify_and_signals_stage_outputs(store, http_client):
     assert sig.offerings[0].name == "Monitor"
 
 
-def test_identify_rejects_output_citing_unknown_evidence(store, http_client):
+def test_identify_repairs_unknown_evidence_without_another_call(store, http_client, caplog):
     from tests.conftest import identity_payload
 
     bad = identity_payload()
     bad["company_name"]["evidence_ids"] = ["E999"]
     client = stage_router({"submit_identity": lambda kw: response(tool_use("submit_identity", bad))})
-    with pytest.raises(LLMOutputError) as exc:
-        _run_to(store, http_client, "identify", client)
-    assert any("E999" in e for e in exc.value.errors)
+    llm = _run_to(store, http_client, "identify", client)
+    ident = store.load_model("identity.json", Identity)
+    assert ident.company_name.evidence_ids == [] and ident.company_name.classification is Classification.ANALYTICAL_INFERENCE
+    assert llm.calls == 1
+    assert any("unknown evidence id E999" in r.message for r in caplog.records)
+
+
+def test_identify_and_signals_share_a_cacheable_prefix(store, http_client):
+    llm = _run_to(store, http_client, "signals")
+    first, second = llm.client.messages.calls[:2]
+    assert first["system"] == second["system"] and first["tools"] == second["tools"]
+    assert first["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert first["tool_choice"]["name"] == "submit_identity" and second["tool_choice"]["name"] == "submit_site_signals"
+    assert all(c["cache_control"] == {"type": "ephemeral"} and c["thinking"] == {"type": "disabled"}
+               for c in llm.client.messages.calls)
 
 
 def test_research_stage_extends_ledger_and_survives_topic_failure(store, http_client):
@@ -142,7 +174,7 @@ def test_research_stage_extends_ledger_and_survives_topic_failure(store, http_cl
     def flaky(kw):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise RuntimeError("api down")
+            raise _server_error()
         return response(search_result_block(["https://news.test/acme-raises"]),
                         tool_use("submit_findings", raw_findings_payload()))
 
@@ -153,6 +185,40 @@ def test_research_stage_extends_ledger_and_survives_topic_failure(store, http_cl
     assert len(res.findings) == 2 and res.rejected
     ledger = store.ledger()
     assert any(e.source_type is SourceType.THIRD_PARTY for e in ledger)
+    assert not store.exists("research.partial.json")
+    usage = store.load_json("usage.json")
+    assert usage["stages"]["research"]["calls"] == 1 and "identify" in usage["stages"]
+
+
+def test_research_stops_on_permanent_error_and_resumes(store, http_client):
+    calls = {"n": 0}
+
+    def second_group_has_no_credit(kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise _no_credit()
+        return response(search_result_block(["https://news.test/acme-raises"]),
+                        tool_use("submit_findings", raw_findings_payload()))
+
+    import anthropic
+
+    llm = _run_to(store, http_client, "signals", stage_router({"submit_findings": second_group_has_no_credit}))
+    with pytest.raises(anthropic.BadRequestError):
+        pipeline.stage_research(store, llm, groups=GROUPS)
+    assert calls["n"] == 2  # stopped at once, no call for the groups after it
+    assert store.load_json("research.partial.json")["done"] == ["funding"]
+    res = pipeline.stage_research(store, llm, groups=GROUPS)  # resumes: only "news" runs
+    assert calls["n"] == 3 and len(res.findings) == 4
+    assert not store.exists("research.partial.json")
+
+
+def test_research_fails_when_every_group_fails(store, http_client):
+    def down(kw):
+        raise _server_error()
+
+    llm = _run_to(store, http_client, "signals", stage_router({"submit_findings": down}))
+    with pytest.raises(StageError, match="every topic group"):
+        pipeline.stage_research(store, llm, groups=GROUPS)
 
 
 def test_analyze_and_narrate_then_report(store, http_client):
@@ -191,16 +257,29 @@ def test_report_renders_sizing_and_omits_uncited_sources(store, http_client):
     assert "| E006 |" not in sources  # a crawled page nobody cited is not listed
 
 
-def test_analyze_semantic_failure_surfaces_errors(store, http_client):
+def test_analyze_downgrades_unsupported_classification_without_retry(store, http_client):
     def bad_fact(kw):
         p = analysis_payload(third_party_id(kw))
         p["swot"]["strengths"][0]["classification"] = "verified_fact"  # cites only first-party E001
+        p["swot"]["strengths"][0]["statement"] += " [E999]"
         return response(tool_use("submit_analysis", p))
 
-    client = stage_router({"submit_analysis": bad_fact})
+    llm = _run_to(store, http_client, "analyze", stage_router({"submit_analysis": bad_fact}))
+    strength = store.load_model("analysis.json", Analysis).swot.strengths[0]
+    assert strength.classification is Classification.COMPANY_CLAIM and "[E999]" not in strength.statement
+    assert [(c.get("tool_choice") or {}).get("name") for c in llm.client.messages.calls].count("submit_analysis") == 1
+
+
+def test_analyze_structural_failure_surfaces_errors(store, http_client):
+    def missing_question(kw):
+        p = analysis_payload(third_party_id(kw))
+        p["strategic"][0]["question"] = "Something else?"
+        return response(tool_use("submit_analysis", p))
+
+    client = stage_router({"submit_analysis": missing_question})
     with pytest.raises(LLMOutputError) as exc:
         _run_to(store, http_client, "analyze", client)
-    assert any("verified_fact requires independent" in e for e in exc.value.errors)
+    assert any("strategic answers must cover" in e for e in exc.value.errors)
 
 
 def test_run_all_produces_report(store, http_client):
@@ -230,6 +309,22 @@ def test_cli_requires_api_key_for_llm_stages(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert cli.main(["--out", str(tmp_path), "identify"]) == 2
     assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+
+def test_cli_reports_api_errors_without_traceback(tmp_path, http_client, monkeypatch, capsys):
+    import anthropic
+    import httpx
+
+    def broke(_kw):
+        req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        body = {"type": "error", "error": {"type": "invalid_request_error", "message": "Your credit balance is too low"}}
+        raise anthropic.BadRequestError("400", response=httpx.Response(400, request=req, json=body), body=body)
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    rc = cli.main(["--out", str(tmp_path / "r"), "--max-pages", "2", "--delay", "0", "run", "--url", SITE],
+                  client_factory=lambda: stage_router({"submit_identity": broke}), http_client=http_client)
+    err = capsys.readouterr().err
+    assert rc == 3 and "400: Your credit balance is too low" in err and "re-run the failed stage" in err
 
 
 def test_cli_reports_stage_errors(tmp_path, monkeypatch, capsys):

@@ -20,16 +20,14 @@ Evidence discipline (non-negotiable):
 - Write in plain business language; translate technical capability into business outcome.
 - Do not repeat marketing language except when describing the company's own positioning."""
 
-IDENTIFY_SYSTEM = ANALYST_ROLE + """
-
-Task: establish the identity of the organisation behind the website from the crawled pages provided.
+# identify and signals share one system prompt (the analyst role plus the crawled pages) so the
+# second call reads the pages from the prompt cache; their tasks go in the user message.
+IDENTIFY_TASK = """Task: establish the identity of the organisation behind the website from the crawled pages provided.
 Be careful with similarly named companies. Where identity is uncertain, list the uncertainty in
 identity_uncertainties instead of guessing. Every attribute with a value needs evidence ids; an attribute
 with no evidence has value null and classification unknown."""
 
-SIGNALS_SYSTEM = ANALYST_ROLE + """
-
-Task: extract operating signals from the company's own website pages. Do not summarise pages; extract how
+SIGNALS_TASK = """Task: extract operating signals from the company's own website pages. Do not summarise pages; extract how
 the business operates: product architecture and portfolio, customer segments, target industries, use
 cases, value propositions, pricing model, sales and distribution model, partnerships and integrations,
 technology, IP / regulatory / certification claims, geography, named customers and case studies,
@@ -101,6 +99,20 @@ RESEARCH_TOPICS: dict[str, str] = {
     "market": "market category definitions, credible market size and growth estimates with methodology, industry reports",
 }
 
+# Topics that share search queries are researched in one call: fewer calls, and search results
+# found for one topic (a funding article naming the founders) serve the others.
+RESEARCH_GROUPS: dict[str, tuple[str, ...]] = {
+    "company": ("corporate", "funding", "leadership"),
+    "performance": ("financials", "news"),
+    "customers": ("customers", "reviews"),
+    "market": ("competitors", "market"),
+    "operations": ("technology", "regulatory", "hiring"),
+}
+
+
+def research_groups() -> dict[str, dict[str, str]]:
+    return {g: {t: RESEARCH_TOPICS[t] for t in topics} for g, topics in RESEARCH_GROUPS.items()}
+
 
 # Where to look beyond the global sources, by the language of the company's website.
 LOCAL_SOURCES: dict[str, str] = {
@@ -140,9 +152,12 @@ def localized(system: str, lang: str | None) -> str:
 
 
 def research_user_prompt(
-    company: str, site: str, topic: str, guidance: str, known: str, site_lang: str | None = DEFAULT_LANG
+    company: str, site: str, topics: dict[str, str], known: str, site_lang: str | None = DEFAULT_LANG,
+    max_searches: int | None = None,
 ) -> str:
     lang = normalize_lang(site_lang) or DEFAULT_LANG
+    topic_lines = "\n".join(f"- {t}: {g}" for t, g in topics.items())
+    budget = f"; you have at most {max_searches} searches for all these topics together" if max_searches else ""
     queries = (
         "Run several distinct web_search queries in English"
         if lang == "en"
@@ -155,8 +170,11 @@ Website language: {LANGUAGE_NAMES[lang]}
 What is already known (from the website; treat as company claims):
 {known}
 
-Research topic: {topic} — {guidance}
+Research topics (set each finding's topic to one of these ids):
+{topic_lines}
 Local sources worth searching for a company whose website is in this language: {LOCAL_SOURCES[lang]}
-{queries} (vary wording, include the company name and the domain), read the results, then call
-submit_findings with every reliable finding on this topic, each with the exact source URLs from the
-search results. Classify each finding correctly. List sub-topics with no reliable result in not_found."""
+{queries} (vary wording, include the company name and the domain){budget}. One search often
+serves several topics, so do not repeat near-identical queries. Read the results, then call
+submit_findings once with every reliable finding on these topics, each with the exact source URLs from
+the search results. Classify each finding correctly. List sub-topics with no reliable result in
+not_found, prefixed with their topic id."""

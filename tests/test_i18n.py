@@ -179,13 +179,14 @@ def test_crawl_records_site_language_and_prompts_follow_it(store, pt_client):
     assert store.meta()["site_lang"] == "pt-br" and store.lang() == "pt-br"
     client = stage_router()
     pipeline.stage_identify(store, LLM(client, model="m"))
-    assert "Brazilian Portuguese" in client.messages.calls[0]["system"]
+    assert "Brazilian Portuguese" in client.messages.calls[0]["system"][0]["text"]
 
 
 def test_research_prompt_names_language_and_local_sources():
-    text = prompts.research_user_prompt("Esfera", PT_SITE, "corporate", "g", "- x", "pt-br")
+    text = prompts.research_user_prompt("Esfera", PT_SITE, {"corporate": "g"}, "- x", "pt-br", 10)
     assert "Brazilian Portuguese" in text and "Receita Federal" in text and "and in English" in text
-    assert "both in" not in prompts.research_user_prompt("Acme", SITE, "corporate", "g", "- x")
+    assert "- corporate: g" in text and "at most 10 searches" in text
+    assert "both in" not in prompts.research_user_prompt("Acme", SITE, {"corporate": "g"}, "- x")
     assert set(prompts.LOCAL_SOURCES) == set(SUPPORTED)
 
 

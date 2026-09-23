@@ -551,3 +551,72 @@ def _models(obj: Any, path: str = "$") -> Iterator[tuple[BaseModel, str]]:
 
 def semantic_errors(obj: BaseModel, ledger: EvidenceLedger) -> list[str]:
     return check_refs(obj, ledger) + check_classifications(obj, ledger)
+
+
+# --------------------------------------------------------------------------- mechanical repair
+
+_SOURCED = {c.value for c in (Classification.VERIFIED_FACT, Classification.COMPANY_CLAIM, Classification.THIRD_PARTY_CLAIM)}
+
+
+def _supported(cls: str, kinds: set[SourceType]) -> str:
+    """The strongest classification the cited evidence supports (same rules as the research stage)."""
+    if cls not in _SOURCED:
+        return cls
+    if not kinds:
+        return Classification.ANALYTICAL_INFERENCE.value
+    first, third = SourceType.FIRST_PARTY in kinds, SourceType.THIRD_PARTY in kinds
+    if cls == Classification.VERIFIED_FACT.value and not third:
+        return Classification.COMPANY_CLAIM.value
+    if cls == Classification.COMPANY_CLAIM.value and not first:
+        return Classification.THIRD_PARTY_CLAIM.value
+    if cls == Classification.THIRD_PARTY_CLAIM.value and not third:
+        return Classification.COMPANY_CLAIM.value
+    return cls
+
+
+def repair_refs(payload: Any, ledger: EvidenceLedger) -> tuple[Any, list[str]]:
+    """Fix, without another model call, the reference errors :func:`semantic_errors` would reject.
+
+    Evidence ids and inline ``[E###]`` citations that are not in the ledger are removed, and a
+    classification the remaining evidence cannot support is lowered to the one it does support
+    (a claim left with no evidence becomes an analytical inference). Every change is returned as
+    a note so it can be logged. Structural problems are left for validation to report.
+    """
+    notes: list[str] = []
+
+    def fix_text(text: str, path: str) -> str:
+        def sub(m: re.Match) -> str:
+            if ledger.has(m.group(1)):
+                return m.group(0)
+            notes.append(f"{path}: removed unknown citation [{m.group(1)}]")
+            return ""
+
+        fixed = CITATION.sub(sub, text)
+        return re.sub(r"[ \t]{2,}", " ", re.sub(r"\s+([.,;:])", r"\1", fixed)) if fixed != text else text
+
+    def walk(node: Any, path: str) -> Any:
+        if isinstance(node, dict):
+            out = {k: walk(v, f"{path}.{k}") for k, v in node.items()}
+            ids = out.get("evidence_ids")
+            if isinstance(ids, list):
+                kept = [i for i in ids if isinstance(i, str) and ledger.has(i)]
+                for i in ids:
+                    if i not in kept:
+                        notes.append(f"{path}: removed unknown evidence id {i}")
+                out["evidence_ids"] = kept
+                cls = out.get("classification")
+                if isinstance(cls, str):
+                    new = _supported(cls, {ledger.get(i).source_type for i in kept})
+                    if "value" in out and out["value"] is None and new != cls:
+                        new = Classification.UNKNOWN.value  # an attribute with no value can only be unknown
+                    if new != cls:
+                        notes.append(f"{path}: classification {cls} -> {new} (supported by the cited evidence)")
+                        out["classification"] = new
+            return out
+        if isinstance(node, list):
+            return [walk(x, f"{path}[{i}]") for i, x in enumerate(node)]
+        if isinstance(node, str):
+            return fix_text(node, path)
+        return node
+
+    return walk(payload, "$"), notes
