@@ -713,10 +713,55 @@ class StrategicAnswer(AnalyticalRow):
     evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
 
+class MaturityLevel(str, Enum):
+    """An ordinal scale with written criteria (prompts.MATURITY_SCALE), not a numeric score."""
+
+    NASCENT = "nascent"
+    DEVELOPING = "developing"
+    ESTABLISHED = "established"
+    LEADING = "leading"
+
+    @property
+    def rank(self) -> int:
+        return list(MaturityLevel).index(self) + 1
+
+
+def _require(*names: str):
+    """json_schema_extra hook: ``names`` are required of the model, while defaults let runs saved
+    before the fields existed still load."""
+    def hook(schema: dict) -> None:
+        required = schema.setdefault("required", [])
+        required.extend(n for n in names if n not in required)
+    return hook
+
+
 class MaturityRow(AnalyticalRow):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, json_schema_extra=_require("level"))
+
     dimension: str = Field(max_length=60)
+    level: MaturityLevel | None = None  # None: the evidence does not support a level
     evidence: str = Field(min_length=1, max_length=800)
     evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
+
+
+class PositionPoint(AnalyticalRow):
+    """One company on the positioning map: low (1), medium (2) or high (3) on each defined axis."""
+
+    name: str = Field(max_length=120)
+    x: int = Field(ge=1, le=3)
+    y: int = Field(ge=1, le=3)
+    rationale: str = Field(min_length=1, max_length=400)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
+
+
+class Positioning(Strict):
+    """A 3x3 competitive map on two axes the analysis defines; placements are inferences."""
+
+    x_axis: str = Field(min_length=1, max_length=80)
+    x_definition: str = Field(min_length=1, max_length=300)
+    y_axis: str = Field(min_length=1, max_length=80)
+    y_definition: str = Field(min_length=1, max_length=300)
+    points: list[PositionPoint] = Field(min_length=2, max_length=12)
 
 
 class Opportunity(AnalyticalRow):
@@ -727,6 +772,8 @@ class Opportunity(AnalyticalRow):
 
 
 class Analysis(Strict):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, json_schema_extra=_require("positioning"))
+
     business_model: BusinessModel
     pains: list[Pain] = Field(min_length=1, max_length=18)
     market: Market
@@ -743,6 +790,7 @@ class Analysis(Strict):
     opportunities: list[Opportunity] = Field(max_length=12)
     analyst_observations: list[Claim] = Field(max_length=12)
     open_questions: list[str] = Field(max_length=20)
+    positioning: Positioning | None = None  # None when the evidence cannot place competitors
 
     @model_validator(mode="after")
     def _fixed_sets(self) -> "Analysis":
@@ -772,8 +820,35 @@ class NarrativeStatement(Strict):
     premise_claim_ids: list[str] = Field(default_factory=list)
 
 
+NARRATIVE_SECTIONS = (
+    "executive_summary", "what_the_company_does", "problems_it_solves", "products_and_services",
+    "customer_segments_and_use_cases", "business_model_and_monetization", "go_to_market", "technology_and_ip",
+    "market_landscape", "competitive_landscape", "differentiation_and_defensibility",
+    "customers_partnerships_ecosystem", "financial_and_funding", "growth_and_traction", "risks_and_red_flags",
+    "strategic_opportunities", "analyst_observations",
+)
+
+
+class Headline(Strict):
+    """A synthesised takeaway. It may only restate what its premise claims say: every number and
+    name in ``text`` must come from them (checked in :func:`narrative_errors`)."""
+
+    text: str = Field(min_length=1, max_length=220)
+    premise_claim_ids: list[str] = Field(min_length=1, max_length=8)
+
+
+class SectionHeadline(Headline):
+    section: Literal[NARRATIVE_SECTIONS]  # type: ignore[valid-type]
+
+
 class Narrative(Strict):
     """Factual prose selects validated claims; inference retains explicit claim premises."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True,
+                              json_schema_extra=_require("key_messages", "section_headlines"))
+
+    key_messages: list[Headline] = Field(default_factory=list, max_length=5)
+    section_headlines: list[SectionHeadline] = Field(default_factory=list, max_length=len(NARRATIVE_SECTIONS))
 
     executive_summary: list[NarrativeStatement] = Field(min_length=5, max_length=10)
     what_the_company_does: list[NarrativeStatement] = Field(min_length=1, max_length=8)
@@ -1014,6 +1089,16 @@ def narrative_errors(obj: Narrative, ledger: EvidenceLedger, catalog: dict[str, 
             if not row.premise_claim_ids or any(x not in catalog or catalog[x]["classification"] in
                     {"unknown", "analytical_inference"} for x in row.premise_claim_ids):
                 errors.append(f"{path}: inference needs validated factual premise claim IDs")
+    headlines = [(f"$.key_messages[{i}]", h) for i, h in enumerate(obj.key_messages)]
+    headlines += [(f"$.section_headlines[{i}]", h) for i, h in enumerate(obj.section_headlines)]
+    for path, h in headlines:
+        premises = [catalog[x] for x in h.premise_claim_ids if x in catalog and catalog[x]["classification"] != "unknown"]
+        if len(premises) != len(h.premise_claim_ids):
+            errors.append(f"{path}: headline premises must be validated claim IDs from the catalog")
+        elif not covers(h.text, "\n".join(p["statement"] for p in premises)):
+            errors.append(f"{path}: headline states a number or name that none of its premise claims contains")
+    if len({h.section for h in obj.section_headlines}) != len(obj.section_headlines):
+        errors.append("$.section_headlines: one headline per section")
     return errors
 
 

@@ -94,6 +94,14 @@ Reuse an existing claim's topic, entity, time_scope and exact statement when add
 Keep conflicting statements separately and use contradicts to name the opposing claim. Record a
 resolved_gaps entry only when a finding in this response supports resolving that exact prior gap."""
 
+# The written criteria behind the maturity level; the report prints them next to the ratings.
+MATURITY_SCALE: dict[str, str] = {
+    "nascent": "little or no evidence of the capability; early experiments or claims only",
+    "developing": "the capability exists and is in use, but is narrow, recent or inconsistent",
+    "established": "the capability is proven at scale in its home market, with independent evidence",
+    "leading": "the capability is a reference point for the market, confirmed by independent sources",
+}
+
 ANALYZE_SYSTEM = ANALYST_ROLE + f"""
 
 Task: reconstruct the business behind the website from the evidence supplied (identity, website signals,
@@ -118,6 +126,12 @@ external findings, evidence ledger). Produce the full analysis:
   {" | ".join(STRATEGIC_QUESTIONS)}
 - maturity rows for exactly these dimensions, using the exact text, with evidence and no numeric scores:
   {" | ".join(MATURITY_DIMENSIONS)}
+  Give each row a level on this ordinal scale, applying the criteria literally; use null when the
+  evidence cannot support any level: {"; ".join(f"{k}: {v}" for k, v in MATURITY_SCALE.items())}.
+- positioning: a competitive map on two axes that matter for buyers in this market (for example
+  breadth of offering, price level, distribution reach), each with a one-sentence definition. Place the
+  company and its main competitors low (1), medium (2) or high (3) on each axis, with a rationale and
+  evidence for every placement. Use null if the evidence cannot place at least two companies.
 - red flags found in the evidence (contradictions, exaggerated claims, unclear pricing, concentration,
   platform dependency, weak differentiation, litigation, turnover, incidents, funding pressure);
 - opportunities (partnership, investment, acquisition, integration, channel, geography, product, data,
@@ -144,7 +158,17 @@ cause, figure or date differently from it, and where sources disagree, say that 
 both. In the problems section, write about the customers' problems, not the company's own risks.
 Use evidence_ids from the selected claim; citations and classification labels are rendered from those fields. The executive summary is 5 to 10 paragraphs and must let a reader understand the
 company without reading the rest. Expose uncertainty and contradictions explicitly. Avoid marketing
-language."""
+language.
+
+Also write, in the same language as the prose:
+- key_messages: the 3 to 5 conclusions an executive must take away, each one sentence of at most 25
+  words, most important first;
+- section_headlines: for each section, an action title: one sentence of at most 20 words that states
+  the section's main finding (not its topic: "Distribution, not technology, is the moat", not
+  "Differentiation").
+Each of these lists premise_claim_ids: the validated catalog claims it rests on. It may combine and
+interpret them, but every number and name it contains must appear in those claims; anything else is
+rejected."""
 
 RESEARCH_TOPICS: dict[str, str] = {
     "corporate": "legal entity, registry / regulatory filings, parent and subsidiaries, headquarters, founding year, ownership, public/private status and ticker",

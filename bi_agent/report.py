@@ -68,10 +68,23 @@ def render_report(
     ledger: EvidenceLedger,
     access_date: str,
     lang: str = "en",
+    catalog: dict[str, dict] | None = None,
 ) -> str:
     t = Translator(lang)
     n = narrative
     a = analysis
+    catalog = catalog or {}
+    headlines = {h.section: h for h in getattr(n, "section_headlines", [])}
+    section_keys = {1: "executive_summary", 3: "what_the_company_does", 4: "problems_it_solves",
+                    5: "products_and_services", 6: "customer_segments_and_use_cases",
+                    7: "business_model_and_monetization", 8: "go_to_market", 9: "technology_and_ip",
+                    10: "market_landscape", 11: "competitive_landscape", 12: "differentiation_and_defensibility",
+                    13: "customers_partnerships_ecosystem", 14: "financial_and_funding", 15: "growth_and_traction",
+                    17: "risks_and_red_flags", 18: "strategic_opportunities", 19: "analyst_observations"}
+
+    def premise_cites(ids: list[str]) -> str:
+        evidence = [e for x in ids for e in catalog.get(x, {}).get("evidence_ids", [])]
+        return _cites(evidence) if evidence else ""
 
     def label(cls: object) -> str:
         return t(getattr(cls, "value", cls))
@@ -89,6 +102,9 @@ def render_report(
 
     def section(num: int, paras: list[str] | None = None) -> None:
         w(f"## {num}. {t(f's{num}')}\n")
+        headline = headlines.get(section_keys.get(num, ""))
+        if headline is not None:  # the action title: the section's finding, not its topic
+            w(f"**{t('takeaway')}:** {headline.text} {premise_cites(headline.premise_claim_ids)}".rstrip() + "\n")
         if paras is not None:
             w(_paras(paras, lang) + "\n")
 
@@ -106,6 +122,12 @@ def render_report(
     w(t("key", labels=", ".join(labels[:-1]) + f" {t('or')} " + labels[-1]) + "\n")
     if meta.get("thin_site"):
         w(f"> {t('thin_site_note', chars=meta.get('site_chars', 0), js=meta.get('js_rendered_pages', 0))}\n")
+
+    if getattr(n, "key_messages", None):
+        w(f"## {t('key_messages')}\n")
+        for i, m in enumerate(n.key_messages, 1):
+            w(f"- {m.text} {premise_cites(m.premise_claim_ids)}".rstrip())
+        w("")
 
     section(1, n.executive_summary)
 
@@ -205,6 +227,17 @@ def render_report(
           f"{label(c.classification)} {_cites(c.evidence_ids, c.premises)} |")
     w("")
 
+    pos = getattr(a, "positioning", None)
+    if pos is not None:
+        w(f"**{t('positioning')}**\n")
+        w(f"{t('axis_line', axis=_cell(pos.x_axis), definition=_cell(pos.x_definition))}  \n"
+          f"{t('axis_line', axis=_cell(pos.y_axis), definition=_cell(pos.y_definition))}\n")
+        w(_head(t("company"), _cell(pos.x_axis), _cell(pos.y_axis), t("rationale"), t("basis")))
+        for p in pos.points:
+            w(f"| {_cell(p.name)} | {t(f'pos.{p.x}')} | {t(f'pos.{p.y}')} | {_cell(p.rationale)} | "
+              f"{label(p.classification)} {_cites(p.evidence_ids, p.premises)} |")
+        w("")
+
     section(12, n.differentiation_and_defensibility)
     w(_head(t("dimension"), t("claimed_diff"), t("observable_diff"), t("reproducibility"), t("evidence")))
     for d in a.differentiation:
@@ -236,10 +269,13 @@ def render_report(
           .replace(" \n", "\n"))
 
     w(f"### {t('business_maturity')}\n")
-    w(_head(t("dimension"), t("evidence")))
+    w(_head(t("dimension"), t("maturity_level"), t("evidence")))
     for r in a.maturity:
-        w(f"| {t.dimension(r.dimension)} | {_cell(r.evidence)} *({label(r.classification)})* {_cites(r.evidence_ids, r.premises)} |")
+        level = t("lvl." + r.level.value) if getattr(r, "level", None) else t("lvl.none")
+        w(f"| {t.dimension(r.dimension)} | {level} | {_cell(r.evidence)} *({label(r.classification)})* {_cites(r.evidence_ids, r.premises)} |")
     w("")
+    scale = "; ".join(f"{t('lvl.' + k)}: {t('lvl.' + k + '.def')}" for k in ("nascent", "developing", "established", "leading"))
+    w(f"_{t('maturity_scale', scale=scale)}_\n")
 
     section(17, n.risks_and_red_flags)
     w(claims(a.red_flags, "no_red_flags") + "\n")

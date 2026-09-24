@@ -601,7 +601,7 @@ def stage_report(store: RunStore) -> str:
     if errors:
         raise StageError("saved narrative failed provenance validation: " + "; ".join(errors[:10]))
     md = render_report(meta=store.meta(), **artifacts, narrative=narrative, ledger=ledger,
-                       access_date=now_iso()[:10], lang=store.lang())
+                       access_date=now_iso()[:10], lang=store.lang(), catalog=catalog)
     store.save_bytes("report.md", md.encode())
     import tempfile
     with tempfile.TemporaryDirectory(dir=store.dir) as directory:

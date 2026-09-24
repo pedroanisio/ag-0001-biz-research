@@ -762,3 +762,23 @@ def test_narrative_statements_are_filled_from_their_validated_claim():
     assert fixed["x"][0]["supporting_passages"] == catalog["C1"]["supporting_passages"]
     assert fixed["x"][1]["premise_claim_ids"] == ["C1"]
     assert fixed["y"][0]["statement"] == "Not in the catalog"  # unknown claims are left for validation to reject
+
+
+def test_headlines_may_only_restate_their_premise_claims():
+    from bi_agent.models import Narrative, narrative_errors
+
+    ledger = EvidenceLedger()
+    evidence(ledger, text="Acme has 50 employees.")
+    catalog = {"C1": {"statement": "Acme has 50 employees.", "classification": "company_claim", "evidence_ids": ["E001"],
+                      "premises": [], "supporting_passages": []}}
+    from bi_agent.models import Headline, SectionHeadline
+    good = Headline(text="With 50 employees, Acme is a small team", premise_claim_ids=["C1"])
+    bad = Headline(text="With 500 employees, Acme is a large team", premise_claim_ids=["C1"])
+    unknown = SectionHeadline(section="go_to_market", text="Sales-led", premise_claim_ids=["C9"])
+    for items, expect in (([good], None), ([bad], "none of its premise claims"), ([unknown], "validated claim IDs")):
+        from bi_agent.models import NARRATIVE_SECTIONS
+        n = Narrative.model_construct(**{k: [] for k in NARRATIVE_SECTIONS},
+                                      key_messages=[h for h in items if not isinstance(h, SectionHeadline)],
+                                      section_headlines=[h for h in items if isinstance(h, SectionHeadline)])
+        errors = [e for e in narrative_errors(n, ledger, catalog) if "headline" in e or "premise" in e]
+        assert (not errors) if expect is None else any(expect in e for e in errors), (items, errors)

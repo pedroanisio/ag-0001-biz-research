@@ -48,12 +48,13 @@ from .i18n import Translator
 
 # --------------------------------------------------------------------------- look
 
-INK = colors.HexColor("#1F2933")
-MUTED = colors.HexColor("#616E7C")
-ACCENT = colors.HexColor("#1D4E89")
-ACCENT_SOFT = colors.HexColor("#E8EEF6")
-RULE = colors.HexColor("#CBD2D9")
-ZEBRA = colors.HexColor("#F5F7FA")
+INK = colors.HexColor("#1A2233")
+MUTED = colors.HexColor("#5F6B7A")
+ACCENT = colors.HexColor("#0B2E59")  # deep navy: headings, rules, table heads
+HIGHLIGHT = colors.HexColor("#2F6DB5")  # one lighter blue for numbers, links and chart marks
+ACCENT_SOFT = colors.HexColor("#EAF0F7")
+RULE = colors.HexColor("#D3D9E0")
+ZEBRA = colors.HexColor("#F6F8FA")
 NOTE_BG = colors.HexColor("#FFF8E6")
 NOTE_EDGE = colors.HexColor("#E0A800")
 
@@ -83,15 +84,91 @@ MARGIN_BOTTOM = 20 * mm
 BODY_W = PAGE_W - 2 * MARGIN_X
 
 FONT, BOLD, ITALIC, BOLD_ITALIC = "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique"
+SERIF, SERIF_BOLD = "Times-Roman", "Times-Bold"
+TTF = False  # True once an embeddable Unicode font family is registered
+
+# Open-licensed (SIL OFL) families looked for at run time; the PDF falls back to the built-in
+# Helvetica/Times when they are not installed, so rendering never depends on them.
+_FONT_DIRS = [Path(__file__).parent / "fonts", Path("/usr/share/fonts/truetype/noto"), Path("/usr/share/fonts/noto"),
+              Path("/usr/share/fonts/truetype"), Path.home() / ".local/share/fonts", Path("/usr/local/share/fonts"),
+              Path("/Library/Fonts"), Path.home() / "Library/Fonts", Path("C:/Windows/Fonts")]
+
+
+def _find_font(name: str) -> Path | None:
+    for directory in _FONT_DIRS:
+        direct = directory / name
+        if direct.is_file():
+            return direct
+    for directory in _FONT_DIRS[:3]:
+        if directory.is_dir():
+            match = next(directory.rglob(name), None)
+            if match:
+                return match
+    return None
+
+
+def _register_fonts() -> None:
+    """Embed Noto Sans (body) and Noto Serif (headlines) when available."""
+    global FONT, BOLD, ITALIC, BOLD_ITALIC, SERIF, SERIF_BOLD, TTF
+    import os
+
+    if os.environ.get("BI_AGENT_PDF_FONTS", "").lower() == "builtin":
+        return
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    sans = {k: _find_font(f"NotoSans-{k}.ttf") for k in ("Regular", "Bold", "Italic", "BoldItalic")}
+    if not all(sans.values()):
+        return
+    try:
+        names = {"Regular": "BiSans", "Bold": "BiSans-Bold", "Italic": "BiSans-Italic", "BoldItalic": "BiSans-BoldItalic"}
+        for k, path in sans.items():
+            pdfmetrics.registerFont(TTFont(names[k], str(path)))
+        pdfmetrics.registerFontFamily("BiSans", normal="BiSans", bold="BiSans-Bold", italic="BiSans-Italic",
+                                      boldItalic="BiSans-BoldItalic")
+        FONT, BOLD, ITALIC, BOLD_ITALIC = names["Regular"], names["Bold"], names["Italic"], names["BoldItalic"]
+        serif = {k: _find_font(f"NotoSerif-{k}.ttf") for k in ("Regular", "Bold")}
+        if all(serif.values()):
+            pdfmetrics.registerFont(TTFont("BiSerif", str(serif["Regular"])))
+            pdfmetrics.registerFont(TTFont("BiSerif-Bold", str(serif["Bold"])))
+            pdfmetrics.registerFontFamily("BiSerif", normal="BiSerif", bold="BiSerif-Bold", italic="BiSerif",
+                                          boldItalic="BiSerif-Bold")
+            SERIF, SERIF_BOLD = "BiSerif", "BiSerif-Bold"
+        TTF = True
+    except Exception:  # a broken font file must never stop the report  # noqa: BLE001
+        FONT, BOLD, ITALIC, BOLD_ITALIC = "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique"
+
+
+_register_fonts()
 
 
 def _styles() -> dict[str, ParagraphStyle]:
-    base = ParagraphStyle("body", fontName=FONT, fontSize=9.5, leading=13.6, textColor=INK, alignment=TA_LEFT,
-                          spaceAfter=5)
+    base = ParagraphStyle("body", fontName=FONT, fontSize=9.5, leading=14.2, textColor=INK, alignment=TA_LEFT,
+                          spaceAfter=6)
     return {
         "body": base,
-        "h1": ParagraphStyle("h1", parent=base, fontName=BOLD, fontSize=15, leading=19, textColor=ACCENT,
-                             spaceBefore=6, spaceAfter=8),
+        "h1": ParagraphStyle("h1", parent=base, fontName=SERIF_BOLD, fontSize=17, leading=21, textColor=ACCENT,
+                             spaceBefore=4, spaceAfter=8),
+        "kicker": ParagraphStyle("kicker", parent=base, fontName=BOLD, fontSize=8, leading=10, textColor=HIGHLIGHT,
+                                 spaceBefore=2, spaceAfter=3),
+        "action": ParagraphStyle("action", parent=base, fontName=SERIF_BOLD, fontSize=16, leading=20.5,
+                                 textColor=ACCENT, spaceBefore=0, spaceAfter=10),
+        "km_title": ParagraphStyle("km_title", parent=base, fontName=SERIF_BOLD, fontSize=24, leading=29,
+                                   textColor=ACCENT, spaceAfter=18),
+        "km_num": ParagraphStyle("km_num", parent=base, fontName=SERIF_BOLD, fontSize=22, leading=24,
+                                 textColor=HIGHLIGHT, spaceAfter=0),
+        "km_text": ParagraphStyle("km_text", parent=base, fontName=SERIF, fontSize=12.5, leading=17.5,
+                                  textColor=INK, spaceAfter=0),
+        "exhibit_no": ParagraphStyle("exhibit_no", parent=base, fontName=BOLD, fontSize=7.5, leading=9.5,
+                                     textColor=HIGHLIGHT, spaceBefore=8, spaceAfter=1),
+        "exhibit_title": ParagraphStyle("exhibit_title", parent=base, fontName=BOLD, fontSize=10, leading=13,
+                                        textColor=ACCENT, spaceAfter=5),
+        "source_line": ParagraphStyle("source_line", parent=base, fontName=ITALIC, fontSize=7, leading=9.5,
+                                      textColor=MUTED, spaceBefore=3, spaceAfter=8),
+        "swot_head": ParagraphStyle("swot_head", parent=base, fontName=BOLD, fontSize=9, leading=11,
+                                    textColor=colors.white, spaceAfter=0),
+        "swot_item": ParagraphStyle("swot_item", parent=base, fontSize=7.8, leading=10.4, spaceAfter=3,
+                                    leftIndent=7, bulletIndent=0),
         "h2": ParagraphStyle("h2", parent=base, fontName=BOLD, fontSize=11.5, leading=15, textColor=INK,
                              spaceBefore=10, spaceAfter=5),
         "label": ParagraphStyle("label", parent=base, fontName=BOLD, fontSize=9.5, leading=13, textColor=ACCENT,
@@ -132,7 +209,10 @@ _CP1252_FALLBACK = {"→": "->", "←": "<-", "≈": "~", "≥": ">=", "≤": "<
 
 
 def _encodable(text: str) -> str:
-    """Keep what Helvetica (cp1252) can draw; transliterate or drop the rest."""
+    """Keep what the font can draw. With the embedded Unicode font everything stays; with the
+    built-in Helvetica (cp1252) other characters are transliterated or dropped."""
+    if TTF:
+        return text
     out = []
     for ch in text:
         try:
@@ -169,7 +249,9 @@ class Inline:
         self.class_by_label = {t(k).lower(): k for k in CLASS_COLORS}
         self.targets = targets  # evidence ids with a row (a link destination) in the Sources table
 
-    def __call__(self, text: str, *, links: bool = True) -> str:
+    def __call__(self, text: str, *, links: bool = True, sup: bool = False) -> str:
+        """``sup``: citations as small superscripts, the way prose footnotes read, instead of brackets."""
+        self._sup = sup
         s = escape(_encodable(text.replace("\\|", "|")))
         urls: list[str] = []
 
@@ -188,8 +270,10 @@ class Inline:
     def _cites(self, m: re.Match) -> str:
         """One compact bracket per run of citations, each id linked to its Sources row."""
         ids = sorted(dict.fromkeys(_CITE.findall(m.group(0))), key=lambda i: int(i[1:]))
-        linked = [f'<a href="#{i}" color="#1D4E89">{i}</a>' if i in self.targets else i for i in ids]
-        return f'<font size="-1.5" color="#616E7C">[{", ".join(linked)}]</font>'
+        linked = [f'<a href="#{i}" color="#2F6DB5">{i}</a>' if i in self.targets else i for i in ids]
+        if getattr(self, "_sup", False):
+            return f'<super><font size="5.5" color="#5F6B7A">{",".join(linked)}</font></super>'
+        return f'<font size="-1.5" color="#5F6B7A">[{", ".join(linked)}]</font>'
 
     def tag(self, key: str, label: str) -> str:
         """A classification as a small tinted tag."""
@@ -299,10 +383,11 @@ def parse_markdown(md: str) -> list[Block]:
 class SectionHeading(Paragraph):
     """A numbered section heading that registers itself in the TOC and the PDF outline."""
 
-    def __init__(self, text: str, style: ParagraphStyle, key: str) -> None:
+    def __init__(self, text: str, style: ParagraphStyle, key: str, plain: str | None = None,
+                 rule: bool = True) -> None:
         super().__init__(text, style)
-        self.key = key
-        self.plain = re.sub(r"<[^>]+>", "", text)
+        self.key, self.rule = key, rule
+        self.plain = plain or re.sub(r"<[^>]+>", "", text)  # what the TOC, outline and running header show
 
     def draw(self) -> None:
         # The running header shows the first section that starts on a page, else the one carried over.
@@ -311,10 +396,10 @@ class SectionHeading(Paragraph):
             self.canv._bi_section, self.canv._bi_set = self.plain, True
         self.canv.bookmarkPage(self.key)
         self.canv.addOutlineEntry(self.plain, self.key, level=0, closed=False)
-        # A rule under the heading, full body width.
-        self.canv.setStrokeColor(RULE)
-        self.canv.setLineWidth(0.6)
-        self.canv.line(0, -3, self._width_available, -3)
+        if self.rule:  # a rule under the heading, full body width
+            self.canv.setStrokeColor(RULE)
+            self.canv.setLineWidth(0.6)
+            self.canv.line(0, -3, self._width_available, -3)
         super().draw()
 
     def wrap(self, availWidth: float, availHeight: float):  # noqa: N803 - reportlab API
@@ -596,6 +681,180 @@ class EvidenceBar(Flowable):
             x += w
 
 
+# --------------------------------------------------------------------------- exhibits
+
+
+class HarveyBall(Flowable):
+    """A maturity level as a quarter-filled circle: 1 (nascent) to 4 (leading), 0 for not rated."""
+
+    def __init__(self, rank: int, size: float = 9) -> None:
+        super().__init__()
+        self.rank, self.size = rank, size
+
+    def wrap(self, *_args):
+        return self.size, self.size
+
+    def draw(self) -> None:
+        c, r = self.canv, self.size / 2
+        c.setStrokeColor(ACCENT)
+        c.setLineWidth(0.8)
+        c.setFillColor(colors.white)
+        c.circle(r, r, r - 0.5, stroke=1, fill=1)
+        if self.rank >= 4:
+            c.setFillColor(ACCENT)
+            c.circle(r, r, r - 0.5, stroke=0, fill=1)
+        elif self.rank > 0:
+            c.setFillColor(ACCENT)
+            c.wedge(0.5, 0.5, self.size - 0.5, self.size - 0.5, 90, -90 * self.rank, stroke=0, fill=1)
+
+
+class PositioningMap(Flowable):
+    """A 3x3 map of the positioning table: companies placed low/medium/high on two defined axes."""
+
+    def __init__(self, points: list[tuple[str, int, int]], x_axis: str, y_axis: str, levels: tuple[str, str, str],
+                 subject: str = "", width: float = 110 * mm, height: float = 88 * mm) -> None:
+        super().__init__()
+        self.points, self.x_axis, self.y_axis, self.levels = points, x_axis, y_axis, levels
+        self.subject, self.width, self.height = subject.casefold(), width, height
+
+    def wrap(self, *_args):
+        return self.width, self.height
+
+    def draw(self) -> None:
+        c = self.canv
+        left, bottom = 21 * mm, 12 * mm
+        w, h = self.width - left - 2 * mm, self.height - bottom - 2 * mm
+        c.setStrokeColor(RULE)
+        c.setLineWidth(0.5)
+        for i in range(4):
+            c.line(left + w * i / 3, bottom, left + w * i / 3, bottom + h)
+            c.line(left, bottom + h * i / 3, left + w, bottom + h * i / 3)
+        c.setFillColor(ZEBRA)
+        c.rect(left + 2 * w / 3, bottom + 2 * h / 3, w / 3, h / 3, stroke=0, fill=1)  # the high/high cell
+        c.setFont(FONT, 6.5)
+        c.setFillColor(MUTED)
+        for i, name in enumerate(self.levels):
+            c.drawCentredString(left + w * (i + 0.5) / 3, bottom - 8, name)
+            c.saveState()
+            c.translate(left - 6, bottom + h * (i + 0.5) / 3)
+            c.rotate(90)
+            c.drawCentredString(0, 0, name)
+            c.restoreState()
+        c.setFont(BOLD, 7.5)
+        c.setFillColor(ACCENT)
+        c.drawCentredString(left + w / 2, bottom - 19, self.x_axis[:70])
+        c.saveState()
+        c.translate(left - 17, bottom + h / 2)
+        c.rotate(90)
+        c.drawCentredString(0, 0, self.y_axis[:60])
+        c.restoreState()
+        crowd: dict[tuple[int, int], int] = {}
+        for name, x, y in self.points:
+            k = crowd.get((x, y), 0)
+            crowd[(x, y)] = k + 1
+            cx = left + w * (x - 0.5) / 3 - w / 7 + (k % 2) * w / 7 * 1.1
+            cy = bottom + h * (y - 0.5) / 3 + h / 9 - (k // 2) * h / 11
+            is_subject = self.subject and (self.subject in name.casefold() or name.casefold() in self.subject)
+            c.setFillColor(HIGHLIGHT if is_subject else ACCENT)
+            c.circle(cx, cy, 2.6 if is_subject else 2, stroke=0, fill=1)
+            c.setFont(BOLD if is_subject else FONT, 6.3)
+            c.setFillColor(INK)
+            c.drawString(cx + 4, cy - 2, name[:22])
+
+
+_MONEY = re.compile(r"(US\$|USD|R\$|BRL|EUR|€|GBP|£|\$)\s*([\d.,]+)\s*"
+                    r"(trilh\w*|trillion|tri|tn|bilh\w*|billion|bi|bn|b|milh\w*|million|mi|mn|mm|m)?\b", re.IGNORECASE)
+_SCALE = {"t": 1e12, "b": 1e9, "m": 1e6}
+
+
+def _money(text: str) -> tuple[str, float] | None:
+    m = _MONEY.search(text)
+    if not m:
+        return None
+    currency = {"us$": "USD", "usd": "USD", "$": "USD", "r$": "BRL", "brl": "BRL", "eur": "EUR", "€": "EUR",
+                "gbp": "GBP", "£": "GBP"}[m.group(1).lower()]
+    number = m.group(2).rstrip(".,")
+    number = number.replace(".", "").replace(",", ".") if re.search(r",\d{1,2}$", number) else number.replace(",", "")
+    try:
+        value = float(number)
+    except ValueError:
+        return None
+    unit = (m.group(3) or "").lower()
+    scale = _SCALE["t"] if unit.startswith("tr") or unit == "tn" else _SCALE["b"] if unit.startswith("b") else \
+        _SCALE["m"] if unit.startswith("m") else 1
+    return currency, value * scale
+
+
+def _money_label(currency: str, value: float) -> str:
+    for scale, unit in ((1e12, "tn"), (1e9, "bn"), (1e6, "mn")):
+        if value >= scale:
+            return f"{currency} {value / scale:.1f} {unit}".replace(".0 ", " ")
+    return f"{currency} {value:,.0f}"
+
+
+class SizingChart(Flowable):
+    """Horizontal bars for the sourced market-size figures that share the most common currency."""
+
+    def __init__(self, rows: list[tuple[str, float, str]], currency: str, width: float = BODY_W) -> None:
+        super().__init__()
+        self.rows, self.currency, self.width = rows, currency, width
+        self.height = 9 * mm * len(rows) + 4 * mm
+
+    def wrap(self, *_args):
+        return self.width, self.height
+
+    def draw(self) -> None:
+        c = self.canv
+        label_w, top = 58 * mm, self.height - 3 * mm
+        biggest = max(v for _l, v, _t in self.rows) or 1
+        for i, (label, value, shown) in enumerate(self.rows):
+            y = top - (i + 1) * 9 * mm + 3 * mm
+            c.setFont(FONT, 7.5)
+            c.setFillColor(INK)
+            c.drawString(0, y + 2, label[:48])
+            bar = (self.width - label_w - 34 * mm) * value / biggest
+            c.setFillColor(HIGHLIGHT if i == 0 else ACCENT)
+            c.rect(label_w, y, max(bar, 1.5), 5.5 * mm * 0.8, stroke=0, fill=1)
+            c.setFont(BOLD, 7.5)
+            c.setFillColor(ACCENT)
+            c.drawString(label_w + bar + 4, y + 2, shown[:40])
+
+
+def _exhibit_head(n: int, title: str, st: dict[str, ParagraphStyle], t: Translator) -> list[Flowable]:
+    # an exhibit title must share its page with at least the first part of the exhibit
+    return [CondPageBreak(55 * mm), Paragraph(escape(_encodable(t("exhibit", n=n).upper())), st["exhibit_no"]),
+            Paragraph(escape(_encodable(title)), st["exhibit_title"])]
+
+
+def _source_line(texts: list[str], st: dict[str, ParagraphStyle], inline: Inline, t: Translator) -> Flowable | None:
+    ids = sorted(dict.fromkeys(i for x in texts for i in _CITE.findall(x)), key=lambda i: int(i[1:]))
+    if not ids:
+        return None
+    shown = ids[:10]
+    text = ", ".join(f'<a href="#{i}" color="#5F6B7A">{i}</a>' if i in inline.targets else i for i in shown)
+    if len(ids) > len(shown):
+        text += " " + escape(_encodable(t("and_more", n=len(ids) - len(shown))))
+    return Paragraph(escape(_encodable(t("exhibit_sources", ids="\x00"))).replace("\x00", text), st["source_line"])
+
+
+def _swot_grid(quadrants: list[tuple[str, list[str]]], st: dict[str, ParagraphStyle], inline: Inline) -> Table:
+    """Strengths / Weaknesses over Opportunities / Threats, each item a short line."""
+    heads = ["#1E7B45", "#B35C00", "#2F6DB5", "#B42318"]
+    cells = []
+    for (title, items), colour in zip(quadrants, heads):
+        head = Table([[Paragraph(escape(_encodable(title)), st["swot_head"])]], colWidths=[BODY_W / 2 - 8])
+        head.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(colour)),
+                                  ("LEFTPADDING", (0, 0), (-1, -1), 6), ("TOPPADDING", (0, 0), (-1, -1), 3),
+                                  ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+        body = [Paragraph("•&nbsp;" + inline(x), st["swot_item"]) for x in items]
+        cells.append([head, Spacer(1, 4), *body])
+    grid = Table([[cells[0], cells[1]], [cells[2], cells[3]]], colWidths=[BODY_W / 2, BODY_W / 2])
+    grid.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                              ("RIGHTPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+                              ("LINEBELOW", (0, 0), (-1, 0), 0.4, RULE)]))
+    return grid
+
+
 # --------------------------------------------------------------------------- document
 
 
@@ -650,8 +909,106 @@ def _note(text: str, st: dict[str, ParagraphStyle], inline: Inline) -> Table:
     return box
 
 
+# Sections whose tagged claim lists move to the appendix: the body keeps prose, tables and exhibits.
+_APPENDIX_SECTIONS = {3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15}
+_TAKEAWAY = re.compile(r"^\*\*(?P<label>[^*]+):\*\*\s*(?P<text>.+)$", re.S)
+
+
+def _is_claim_list(block: Block) -> bool:
+    return block.kind == "bullets" and any(_CLASS.search(x) for x in block.items)
+
+
+def _sections(blocks: list[Block]) -> list[tuple[Block, list[Block]]]:
+    out: list[tuple[Block, list[Block]]] = []
+    for b in blocks:
+        if b.kind == "h1":
+            out.append((b, []))
+        elif out:
+            out[-1][1].append(b)
+    return out
+
+
+def _bullets(items: list[str], st: dict[str, ParagraphStyle], inline: Inline) -> Flowable:
+    return ListFlowable(
+        [ListItem(Paragraph(inline(x), st["bullet"]), leftIndent=11, value="circle") for x in items],
+        bulletType="bullet", start="•", bulletFontSize=7, bulletColor=HIGHLIGHT, leftIndent=11, bulletOffsetY=-1)
+
+
+def _key_messages_page(items: list[str], title: str, st: dict[str, ParagraphStyle], inline: Inline) -> list[Flowable]:
+    story: list[Flowable] = [SectionHeading(escape(_encodable(title)), st["km_title"], "key-messages", rule=False)]
+    for n, text in enumerate(items, 1):
+        row = Table([[Paragraph(f"{n:02d}", st["km_num"]), Paragraph(inline(text, sup=True), st["km_text"])]],
+                    colWidths=[16 * mm, BODY_W - 16 * mm])
+        row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                 ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+                                 ("LINEBELOW", (0, 0), (-1, -1), 0.4, RULE)]))
+        story.append(row)
+    return story + [PageBreak()]
+
+
+def _maturity_table(block: Block, st: dict[str, ParagraphStyle], inline: Inline, t: Translator) -> Table:
+    level_col = _column(block.rows, t, "maturity_level")
+    ranks = {t(f"lvl.{k}").lower(): i for i, k in enumerate(("nascent", "developing", "established", "leading"), 1)}
+    data = [[Paragraph(inline(c, links=False), st["head"]) for c in block.rows[0]]]
+    for row in block.rows[1:]:
+        cells: list = []
+        for c, text in enumerate(row):
+            if c == level_col:
+                ball = Table([[HarveyBall(ranks.get(text.strip().lower(), 0)), Paragraph(inline(text), st["cell"])]],
+                             colWidths=[12, 26 * mm])
+                ball.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                          ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+                cells.append(ball)
+            else:
+                cells.append(Paragraph(inline(text), st["cell"]))
+        data.append(cells)
+    widths = [BODY_W * 0.22, 40 * mm, BODY_W * 0.78 - 40 * mm] if level_col == 1 else None
+    table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+    style = [("BACKGROUND", (0, 0), (-1, 0), ACCENT), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+             ("LINEBELOW", (0, 0), (-1, -1), 0.4, RULE), ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+             ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5), ("LEFTPADDING", (0, 0), (-1, -1), 4)]
+    table.setStyle(TableStyle(style))
+    return table
+
+
+def _positioning_exhibit(table: Block, axes: str, t: Translator, subject: str) -> Flowable | None:
+    head = table.rows[0]
+    if len(head) < 3:
+        return None
+    level = {t(f"pos.{i}").lower(): i for i in (1, 2, 3)}
+    points = [(r[0], level.get(r[1].strip().lower(), 0), level.get(r[2].strip().lower(), 0)) for r in table.rows[1:]]
+    points = [p for p in points if p[1] and p[2]]
+    if len(points) < 2:
+        return None
+    return PositioningMap(points, head[1], head[2], (t("pos.1"), t("pos.2"), t("pos.3")), subject)
+
+
+def _sizing_exhibit(table: Block, t: Translator) -> Flowable | None:
+    metric, value, year = (_column(table.rows, t, k) for k in ("metric", "value", "year"))
+    if value is None:
+        return None
+    parsed = []
+    for r in table.rows[1:]:
+        money = _money(r[value])
+        if money:
+            label = " ".join(x for x in (r[metric] if metric is not None else "", r[year] if year is not None else "") if x)
+            parsed.append((label or r[value][:30], money[0], money[1], _money_label(*money)))
+    if not parsed:
+        return None
+    currency = max({c for _l, c, _v, _s in parsed}, key=lambda c: sum(1 for p in parsed if p[1] == c))
+    rows = [(label, v, shown) for label, c, v, shown in parsed if c == currency]
+    return SizingChart(rows, currency)
+
+
 def build_story(md: str, lang: str) -> tuple[list[Flowable], str]:
-    """The flowables for ``md`` and the running-header text."""
+    """The flowables for ``md`` and the running-header text.
+
+    Layout, in reading order: cover; key messages (when the narrative has them); contents; the
+    numbered sections, each opening with its action title when there is one, prose with superscript
+    citations, and numbered exhibits (tables, cards, SWOT grid, positioning map, market-size chart,
+    maturity ratings) with a source line; an appendix holding the tagged claim lists of the body
+    sections; the Sources table last.
+    """
     t = Translator(lang)
     st = _styles()
     blocks = parse_markdown(md)
@@ -661,61 +1018,147 @@ def build_story(md: str, lang: str) -> tuple[list[Flowable], str]:
     targets = {r[0] for b in blocks[at:] if b.kind == "table" for r in b.rows[1:]
                if r and re.fullmatch(r"E\d{3,}", r[0])} if at is not None else set()
     inline = Inline(t, targets)
+    title = next((b.text for b in blocks if b.kind == "title"), "")
+    subject = title.partition(":")[2].strip()
 
     story: list[Flowable] = _cover(blocks[:first_section], st, inline, t,
                                    facts=_key_facts(blocks, t), counts=_evidence_counts(blocks[first_section:], inline))
     story += [NextPageTemplate("body"), PageBreak()]
+    sections = _sections(blocks[first_section:])
+    key_messages = next((body for h, body in sections if h.text == t("key_messages")), None)
+    if key_messages:
+        items = [x for b in key_messages if b.kind == "bullets" for x in b.items]
+        if items:
+            story += _key_messages_page(items, t("key_messages"), st, inline)
     toc = TableOfContents(levelStyles=[st["toc1"]], dotsMinLevel=0)
     story += [Paragraph(escape(_encodable(t("contents"))), st["toc_title"]), toc, PageBreak()]
 
-    in_sources = False
-    pending_label: Flowable | None = None
-    for n, b in enumerate(blocks[first_section:]):
-        if b.kind == "h1":
-            in_sources = b.text == sources_heading
-            story += [CondPageBreak(40 * mm), SectionHeading(inline(b.text, links=False), st["h1"], f"s{n}")]
+    exhibit = 0
+    appendix: list[tuple[str, list[Flowable]]] = []
+    takeaway = t("takeaway").lower()
+    sources: tuple[Block, list[Block]] | None = None
+
+    def exhibit_head(title_text: str) -> list[Flowable]:
+        nonlocal exhibit
+        exhibit += 1
+        return _exhibit_head(exhibit, title_text, st, t)
+
+    for n, (head, body) in enumerate(sections):
+        if head.text == t("key_messages"):
             continue
-        if b.kind == "h2":
-            story += [CondPageBreak(25 * mm), Paragraph(inline(b.text, links=False), st["h2"])]
+        if head.text == sources_heading:
+            sources = (head, body)
             continue
-        if b.kind == "label":
-            pending_label = Paragraph(inline(b.text, links=False), st["label"])
-            continue
-        if b.kind == "para":
-            flow: Flowable = Paragraph(inline(b.text), st["body"])
-        elif b.kind == "bullets":
-            flow = ListFlowable(
-                [ListItem(Paragraph(inline(x), st["bullet"]), leftIndent=11, value="circle") for x in b.items],
-                bulletType="bullet", start="•", bulletFontSize=7, bulletColor=ACCENT, leftIndent=11,
-                bulletOffsetY=-1)
-        elif b.kind == "quote":
-            flow = _note(b.text, st, inline)
-        elif b.kind == "table" and b.rows and not in_sources and max(len(r) for r in b.rows) >= 7:
-            if pending_label is not None:
-                story.append(pending_label)
-                pending_label = None
-            story += _cards(b, st, inline, t)
-            continue
-        elif b.kind == "table" and b.rows:
-            if in_sources:
-                b, caption = _lean_sources(b, t)
+        m = re.match(r"(\d+)\.\s+(.*)", head.text)
+        num, topic = (int(m.group(1)), m.group(2)) if m else (0, head.text)
+        first = body[0] if body else None
+        tk = _TAKEAWAY.match(first.text) if first is not None and first.kind == "para" else None
+        if tk and tk.group("label").strip().lower() == takeaway:
+            story += [CondPageBreak(60 * mm),
+                      SectionHeading(escape(_encodable(f"{num:02d}  ·  {topic}".upper())), st["kicker"], f"s{n}",
+                                     plain=head.text, rule=False),
+                      Paragraph(inline(tk.group("text"), sup=True), st["action"])]
+            body = body[1:]
+        else:
+            story += [CondPageBreak(40 * mm), SectionHeading(inline(head.text, links=False), st["h1"], f"s{n}")]
+
+        moved: list[Flowable] = []
+        pending: Block | None = None
+        subheading = ""  # the latest h2 names the exhibits under it
+        i = 0
+        while i < len(body):
+            b = body[i]
+            nxt = body[i + 1] if i + 1 < len(body) else None
+            # SWOT: four h2 headings each followed by a claim list -> one 2x2 exhibit
+            if num == 16 and b.kind == "h2" and b.text == t("strengths"):
+                quads, j = [], i
+                for key in ("strengths", "weaknesses", "opportunities", "threats"):
+                    if j < len(body) and body[j].kind == "h2" and body[j].text == t(key):
+                        items = body[j + 1].items if j + 1 < len(body) and body[j + 1].kind == "bullets" else []
+                        quads.append((t(key), items))
+                        j += 2 if items else 1
+                if len(quads) == 4:
+                    texts = [x for _q, items in quads for x in items]
+                    story += exhibit_head(t("swot_grid")) + [_swot_grid(quads, st, inline)]
+                    line = _source_line(texts, st, inline, t)
+                    story += [line] if line else []
+                    i = j
+                    continue
+            if b.kind == "h2":
+                subheading = b.text
+                story += [CondPageBreak(25 * mm), Paragraph(inline(b.text, links=False), st["h2"])]
+            elif b.kind == "label":
+                pending = b
+            elif b.kind == "para":
+                # a paragraph between a label and its table (the positioning axes) keeps the label pending
+                if pending is not None and not (nxt is not None and nxt.kind == "table"):
+                    story.append(Paragraph(inline(pending.text, links=False), st["label"]))
+                    pending = None
+                story.append(Paragraph(inline(b.text, sup=True), st["body" if pending is None else "caption"]))
+            elif b.kind == "quote":
+                story.append(_note(b.text, st, inline))
+            elif b.kind == "bullets":
+                if num in _APPENDIX_SECTIONS and _is_claim_list(b):
+                    if pending is not None:
+                        moved.append(Paragraph(inline(pending.text, links=False), st["label"]))
+                    moved.append(_bullets(b.items, st, inline))
+                else:
+                    flow = _bullets(b.items, st, inline)
+                    story.append(KeepTogether([Paragraph(inline(pending.text, links=False), st["label"]), flow])
+                                 if pending is not None else flow)
+                pending = None
+            elif b.kind == "table" and b.rows:
+                cells = [c for r in b.rows[1:] for c in r]
+                label = pending.text if pending is not None else (subheading or topic)
+                pending = None
+                if label == t("positioning"):
+                    chart = _positioning_exhibit(b, "", t, subject)
+                    story += exhibit_head(label)
+                    if chart is not None:
+                        story += [chart, Spacer(1, 4)]
+                    story.append(_table(b, st, inline, anchors=False))
+                elif max(len(r) for r in b.rows) >= 7:
+                    story += exhibit_head(label) + _cards(b, st, inline, t)
+                elif _column(b.rows, t, "maturity_level") is not None:
+                    story += exhibit_head(t("business_maturity")) + [_maturity_table(b, st, inline, t)]
+                elif num == 2:
+                    story.append(_table(b, st, inline, anchors=False))
+                    cells = []
+                else:
+                    story += exhibit_head(label)
+                    chart = _sizing_exhibit(b, t) if _column(b.rows, t, "metric") is not None else None
+                    if chart is not None:
+                        story += [Paragraph(escape(_encodable(t("sizing_chart"))), st["caption"]), chart, Spacer(1, 4)]
+                    story.append(_table(b, st, inline, anchors=False))
+                line = _source_line(cells, st, inline, t) if cells else None
+                if line is not None:
+                    story.append(line)
+            i += 1
+        if pending is not None:
+            story.append(Paragraph(inline(pending.text, links=False), st["label"]))
+        if moved:
+            appendix.append((head.text, moved))
+
+    if appendix:
+        story += [PageBreak(), SectionHeading(escape(_encodable(t("appendix"))), st["h1"], "appendix"),
+                  Paragraph(escape(_encodable(t("appendix_note"))), st["caption"])]
+        for section_title, flows in appendix:
+            story += [CondPageBreak(30 * mm), Paragraph(inline(section_title, links=False), st["h2"]), *flows]
+    if sources is not None:
+        head, body = sources
+        story += [PageBreak(), SectionHeading(inline(head.text, links=False), st["h1"], "sources")]
+        for b in body:
+            if b.kind == "table" and b.rows:
+                lean, caption = _lean_sources(b, t)
                 if caption:
                     story.append(Paragraph(escape(_encodable(caption)), st["caption"]))
-            flow = _table(b, st, inline, anchors=in_sources)
-        else:
-            continue
-        if pending_label is not None:  # keep a label with the first thing under it
-            story.append(KeepTogether([pending_label, flow]) if b.kind != "table" else pending_label)
-            if b.kind == "table":
-                story.append(flow)
-            pending_label = None
-        else:
-            story.append(flow)
-        story.append(Spacer(1, 2))
-    if pending_label is not None:
-        story.append(pending_label)
-
-    title = next((b.text for b in blocks if b.kind == "title"), "")
+                story.append(_table(lean, st, inline, anchors=True))
+            elif b.kind == "para":
+                story.append(Paragraph(inline(b.text), st["body"]))
+            elif b.kind == "bullets":
+                story.append(_bullets(b.items, st, inline))
+            elif b.kind == "label":
+                story.append(Paragraph(inline(b.text, links=False), st["label"]))
     return story, _encodable(title)
 
 

@@ -272,6 +272,8 @@ def test_analyze_and_narrate_then_report(store, http_client):
         assert f"\n## {i}. " in md, f"section {i} missing"
     assert "| Company | Acme Widgets *(Company claim)* [E001] |" in md
     assert "| Rival Co | Direct |" in md
+    assert "## Key messages" in md and "**Takeaway:**" in md  # narrative key messages and an action title
+    assert "| Dimension | Level | Evidence |" in md and "Not rated" in md  # maturity levels, none given here
     assert "Series A raised *(Third-party claim)*" in md
     assert "| E001 |" in md and "news.test/acme-raises" in md
     assert "Discarded during verification" in md

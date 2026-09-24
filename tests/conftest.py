@@ -241,7 +241,12 @@ def narrative_payload(catalog=None) -> dict:
     key, item = next((k, v) for k, v in catalog.items() if v["classification"] == "company_claim")
     row = {"claim_id": key, "statement": item["statement"], "classification": item["classification"],
            "evidence_ids": item["evidence_ids"]}
-    return {name: [dict(row) for _ in range(5 if name == "executive_summary" else 1)] for name in Narrative.model_fields}
+    from bi_agent.models import NARRATIVE_SECTIONS
+    payload = {name: [dict(row) for _ in range(5 if name == "executive_summary" else 1)] for name in NARRATIVE_SECTIONS}
+    payload["key_messages"] = [{"text": item["statement"], "premise_claim_ids": [key]}]
+    payload["section_headlines"] = [{"section": "what_the_company_does", "text": item["statement"],
+                                     "premise_claim_ids": [key]}]
+    return payload
 
 
 def third_party_id(kwargs: dict) -> str:

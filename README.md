@@ -58,6 +58,17 @@ Loopback, private and link-local destinations are rejected by default. `--allow-
 
 One URL identity policy applies throughout: normalize scheme/host and the scheme's default port, preserve path/query case, trailing slash and non-default ports, strip fragments, and link aliases only through observed redirects. Tracking parameters are preserved by default; the URL utility exposes their removal as an explicit option.
 
+## Report layout
+
+`report` writes `report.md` and a typeset `report.pdf`. The PDF is a second rendering of the Markdown and adds no facts:
+
+- **Key messages** (a page after the cover) and an **action title** per section, from `narrate`. Each lists the validated catalog claims it rests on, and every number and name in it must appear in those claims, or it is rejected like any other unsupported statement.
+- **Numbered exhibits** with a source line: tables, cards for wide tables (offerings, competitors), a SWOT 2×2 grid, a market-size chart (sourced figures in the most common currency), a **competitive positioning map** on two axes that `analyze` must define, and **maturity ratings** drawn as filled circles. Maturity levels use a written four-step scale (nascent, developing, established, leading) printed under the table; a dimension the evidence cannot rate is shown as "not rated". There are no numeric scores.
+- **Prose first, evidence in an appendix.** Section bodies hold prose (citations as small superscripts), tables and exhibits. The per-claim lists with classification tags move to an appendix, and the Sources table comes last.
+- **Typography:** Noto Sans for body text and Noto Serif for headlines, embedded when installed (`fonts-noto-core` on Debian/Ubuntu, or TTF files in `bi_agent/fonts/`). Without them the PDF falls back to the built-in Helvetica/Times; `BI_AGENT_PDF_FONTS=builtin` forces that.
+
+Runs made before these fields existed still render: without key messages, action titles, levels or positioning, those elements are simply left out.
+
 ## Usage, budgets and options
 
 Each API call reserves an allowance in `usage.json` **before** sending the request, then immediately persists its final usage. Records include run/stage/attempt/call IDs, model, token/cache/search counts, and pricing assumptions. Totals are derived from the cumulative history; retries and stage restarts never replace earlier charges. Interrupted calls retain their reservation with unavailable final usage. Unknown prices stay unknown. Estimates use the configured price table and are not vendor invoices.
