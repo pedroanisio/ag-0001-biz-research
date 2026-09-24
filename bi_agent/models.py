@@ -360,6 +360,10 @@ def supported_classification(cls: str, items: list[Evidence], statement: str = "
 # --------------------------------------------------------------------------- claims
 
 
+# A claim naming many items (15 carmaker partnerships) needs one citation per page.
+MAX_CITATIONS = 20
+
+
 class SupportingPassage(Strict):
     field: str = "statement"
     evidence_id: str
@@ -371,7 +375,7 @@ class Claim(Strict):
     premises: list[SupportingPassage] = Field(default_factory=list)
     statement: str = Field(min_length=1, max_length=1200)
     classification: Classification
-    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
     @field_validator("evidence_ids")
     @classmethod
@@ -402,7 +406,7 @@ class Attr(Strict):
     premises: list[SupportingPassage] = Field(default_factory=list)
     value: str | None = Field(default=None, max_length=1000)  # resolve merges website and registry detail
     classification: Classification = Classification.UNKNOWN
-    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
     @model_validator(mode="after")
     def _consistent(self) -> "Attr":
@@ -488,7 +492,7 @@ class Offering(Strict):
     business_benefit: str = Field(max_length=600)
     monetization: str = Field(max_length=400)
     classification: Classification
-    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
 
 class SiteSignals(Strict):
@@ -598,7 +602,7 @@ class Pain(AnalyticalRow):
     kind: PainKind
     description: str = Field(max_length=600)
     consequence_if_unsolved: str = Field(max_length=600)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
 
 class MarketSize(AnalyticalRow):
@@ -645,7 +649,7 @@ class Competitor(Strict):
     key_strength: str = Field(max_length=400)
     key_difference: str = Field(max_length=400)
     classification: Classification
-    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
 
 class Reproducibility(str, Enum):
@@ -660,7 +664,7 @@ class Differentiator(AnalyticalRow):
     claimed: str = Field(max_length=600)
     observable: str = Field(max_length=600)
     reproducibility: Reproducibility
-    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
 
 class BusinessModel(Strict):
@@ -706,20 +710,20 @@ MATURITY_DIMENSIONS: tuple[str, ...] = (
 class StrategicAnswer(AnalyticalRow):
     question: str = Field(max_length=200)
     answer: str = Field(min_length=1, max_length=1500)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
 
 class MaturityRow(AnalyticalRow):
     dimension: str = Field(max_length=60)
     evidence: str = Field(min_length=1, max_length=800)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
 
 class Opportunity(AnalyticalRow):
     kind: str = Field(max_length=80)
     description: str = Field(max_length=600)
     rationale: str = Field(max_length=800)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=MAX_CITATIONS)
 
 
 class Analysis(Strict):
@@ -888,7 +892,7 @@ def semantic_errors(obj: BaseModel, ledger: EvidenceLedger) -> list[str]:
             quoted_ids = {s.evidence_id for s in supports}
             for item in items:
                 relevant = item.id in quoted_ids or any(
-                    passage_supported(text, item) or _shares_anchor(text, item.content or "") for _f, text in fields)
+                    passage_supported(text, item) or _cites_something(text, item) for _f, text in fields)
                 if not relevant:
                     errors.append(f"{path}: citation {item.id} has no support for this claim")
         if cls == Classification.ANALYTICAL_INFERENCE and not isinstance(model, NarrativeStatement):
@@ -977,6 +981,88 @@ def narrative_errors(obj: Narrative, ledger: EvidenceLedger, catalog: dict[str, 
 
 # --------------------------------------------------------------------------- mechanical repair
 
+_SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+_PROSE_KEYS = {"statement", "answer", "evidence", "value", "description", "rationale", "claimed", "observable"}
+
+
+_NON_FACT_KEYS = {"classification", "kind", "category", "question", "dimension", "metric", "reproducibility", "topic"}
+
+
+def _cites_something(text: str, e: Evidence) -> bool:
+    """A cited source is relevant when it carries one of the claim's hard facts or two of its word stems."""
+    if not text or not e.content:
+        return True  # nothing to judge by: keep it and let validation decide
+    return _shares_anchor(text, e.content) or len(_stems(text) & _stems(e.content)) >= 2
+
+
+def _inference_text(node: dict) -> str:
+    return " ".join(v for k, v in node.items() if k in _PROSE_KEYS and isinstance(v, str))
+
+
+def derive_premises(text: str, items: list[Evidence], per_source: int = 2, limit: int = 4) -> list[dict]:
+    """Premises for an inference that cites sources but names none: from each cited, retrieved page,
+    the sentences that share the inference's hard facts or at least two of its word stems. Every
+    premise is verbatim retrieved text, so it passes the same check a model-written premise must."""
+    numbers, names = claim_anchors(text)
+    anchors, stems = numbers | names, _stems(text)
+    premises: list[dict] = []
+    for e in items:
+        if not e.retrieval_method or not e.content:
+            continue
+        scored = []
+        for sentence in _SENTENCE.split(e.content):
+            sentence = sentence.strip()
+            if not 30 <= len(sentence) <= 400:
+                continue
+            folded = _fold(sentence)
+            score = 3 * sum(_contains(folded, a) for a in anchors) + len(stems & _stems(sentence))
+            if score >= 2:
+                scored.append((score, sentence))
+        for _score, sentence in sorted(scored, key=lambda x: -x[0])[:per_source]:
+            premises.append({"evidence_id": e.id, "passage": sentence})
+        if len(premises) >= limit:
+            break
+    return premises[:limit]
+
+
+SUPPORT_ERRORS = ("no retrieved passage supports", "unsupported quoted passage", "has no support for this claim",
+                  "requires explicit retrieved premises", "unsupported inference premise", "verified_fact requires")
+
+
+def omit_unsupported(payload: Any, errors: list[str]) -> tuple[Any, list[str]]:
+    """Last resort after the final attempt: drop the list items that still lack retrieved support.
+
+    Applies only when every remaining error is a support error on an item of a list (a competitor,
+    a SWOT entry, a market-size row). Such an item is omitted, not rewritten, the way the research
+    stage discards findings it cannot verify. Anything else (a structural error, a required single
+    field, the fixed strategic questions) returns no omissions, and the stage fails as before.
+    """
+    import copy
+
+    targets: dict[tuple, set[int]] = {}
+    for error in errors:
+        path, _, message = error.partition(": ")
+        steps = re.findall(r"\.(\w+)|\[(\d+)\]", path[1:]) if path.startswith("$") else []
+        if not steps or not any(m in message for m in SUPPORT_ERRORS) or not steps[-1][1]:
+            return payload, []
+        key = tuple(name or int(idx) for name, idx in steps[:-1])
+        targets.setdefault(key, set()).add(int(steps[-1][1]))
+    payload = copy.deepcopy(payload)
+    omitted: list[str] = []
+    for key, indexes in targets.items():
+        node = payload
+        for step in key:
+            node = node[step]
+        if not isinstance(node, list):
+            return payload, []
+        for i in sorted(indexes, reverse=True):
+            item = node.pop(i)
+            text = next((item[k] for k in ("statement", "name", "value", "dimension", "metric", "kind", "description")
+                         if isinstance(item, dict) and item.get(k)), "")
+            omitted.append(f"$.{'.'.join(map(str, key))}[{i}]: {str(text)[:160]}")
+    return payload, omitted
+
+
 def repair_refs(payload: Any, ledger: EvidenceLedger) -> tuple[Any, list[str]]:
     """Remove unresolved list references and lower unsupported classifications.
 
@@ -1006,10 +1092,20 @@ def repair_refs(payload: Any, ledger: EvidenceLedger) -> tuple[Any, list[str]]:
                         notes.append(f"{path}: removed unknown evidence id {i}")
                 for sp in out.get("supporting_passages") or []:
                     eid = sp.get("evidence_id") if isinstance(sp, dict) else None
-                    if (isinstance(eid, str) and eid not in kept and ledger.has(eid) and len(kept) < 12
+                    if (isinstance(eid, str) and eid not in kept and ledger.has(eid) and len(kept) < MAX_CITATIONS
                             and isinstance(sp.get("passage"), str) and passage_in_source(ledger.get(eid), sp["passage"])):
                         kept.append(eid)  # a verbatim quote from a retrieved page the model forgot to cite
                         notes.append(f"{path}: cited {eid}, the source of a verbatim supporting passage")
+                text = _inference_text(out) or " ".join(
+                    v for k, v in out.items() if isinstance(v, str) and k not in _NON_FACT_KEYS)
+                quoted_ids = {sp.get("evidence_id") for key in ("supporting_passages", "premises")
+                              for sp in (out.get(key) or []) if isinstance(sp, dict)}
+                relevant = [i for i in kept if i in quoted_ids or _cites_something(text, ledger.get(i))]
+                if relevant and len(relevant) < len(kept):
+                    for i in kept:
+                        if i not in relevant:
+                            notes.append(f"{path}: dropped citation {i}, which shares nothing with the claim")
+                    kept = relevant
                 out["evidence_ids"] = kept
                 cls = out.get("classification")
                 if isinstance(cls, str) and cls in {"verified_fact", "company_claim", "third_party_claim"} and not out.get("supporting_passages"):
@@ -1026,6 +1122,11 @@ def repair_refs(payload: Any, ledger: EvidenceLedger) -> tuple[Any, list[str]]:
                     if supports:
                         out["supporting_passages"] = supports
                         notes.append(f"{path}: attached exact retrieved supporting passages")
+                if cls == Classification.ANALYTICAL_INFERENCE.value and not out.get("premises") and kept:
+                    premises = derive_premises(_inference_text(out), [ledger.get(i) for i in kept])
+                    if premises:
+                        out["premises"] = premises
+                        notes.append(f"{path}: took {len(premises)} premise(s) verbatim from the cited sources")
                 if isinstance(cls, str):
                     new = supported_classification(cls, [ledger.get(i) for i in kept], out.get("statement", out.get("value", "")) or "")
                     if "value" in out and out["value"] is None:

@@ -52,6 +52,7 @@ from .models import (
     normalize_url,
     repair_refs,
     semantic_errors,
+    omit_unsupported,
     passage_in_source,
     passage_supported,
     SupportingPassage,
@@ -210,7 +211,7 @@ def stage_signals(store: RunStore, llm: LLM) -> SiteSignals:
         signals = llm.structured(
             system=system, user=user, schema=SiteSignals, tool_name="submit_site_signals",
             shared_tools=SITE_TOOLS, repair=lambda p: repair_refs(p, ledger),
-            semantic_check=lambda o: semantic_errors(o, ledger),
+            semantic_check=lambda o: semantic_errors(o, ledger), omit=omit_unsupported,
         )
     store.save_model("signals.json", signals)
     return signals
@@ -543,7 +544,7 @@ def stage_analyze(store: RunStore, llm: LLM) -> Analysis:
         analysis = llm.structured(
             system=prompts.localized(prompts.ANALYZE_SYSTEM, store.lang()), user=user, schema=Analysis,
             tool_name="submit_analysis", repair=lambda p: repair_refs(p, ledger),
-            semantic_check=lambda o: semantic_errors(o, ledger),
+            semantic_check=lambda o: semantic_errors(o, ledger), omit=omit_unsupported,
         )
     store.save_model("analysis.json", analysis)
     return analysis

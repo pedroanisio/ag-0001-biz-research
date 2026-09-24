@@ -673,3 +673,66 @@ def test_value_may_combine_facts_from_its_cited_sources_but_not_add_uncited_ones
     assert semantic_errors(ok, ledger) == []
     added = ok.model_copy(update={"value": value + ", listada na NYSE desde 2010"})  # in neither cited source
     assert any("unsupported quoted passage" in e for e in semantic_errors(added, ledger))
+
+
+
+def test_inference_premises_are_taken_verbatim_from_cited_sources():
+    """Regression (semparar analyze): strategic answers cited sources but listed no premises."""
+    from bi_agent.models import StrategicAnswer, repair_refs
+
+    ledger = EvidenceLedger()
+    evidence(ledger, "https://news.test/a", "O Sem Parar tem mais de 7 milhões de clientes ativos. Outro assunto qualquer aqui.",
+             SourceKind.NEWS)
+    payload = {"question": "What appears to be the company's strongest competitive asset?",
+               "answer": "A base de mais de 7 milhões de clientes ativos é o ativo mais forte.",
+               "classification": "analytical_inference", "evidence_ids": ["E001"]}
+    fixed, notes = repair_refs(payload, ledger)
+    assert fixed["premises"] == [{"evidence_id": "E001", "passage": "O Sem Parar tem mais de 7 milhões de clientes ativos."}]
+    assert semantic_errors(StrategicAnswer.model_validate(fixed), ledger) == []
+    unrelated = dict(payload, answer="Uma vantagem regulatória inédita no setor aéreo.")
+    assert not repair_refs(unrelated, ledger)[0].get("premises")  # nothing on the page relates: no premise
+
+
+
+def test_final_attempt_omits_only_unsupported_list_items():
+    from bi_agent.models import omit_unsupported
+
+    payload = {"swot": {"strengths": [{"statement": "a"}, {"statement": "b"}, {"statement": "c"}]},
+               "differentiation": [{"dimension": "Distribution"}]}
+    errors = ["$.swot.strengths[0]: no retrieved passage supports 'a'; use an exact source excerpt",
+              "$.swot.strengths[2]: citation E009 has no support for this claim",
+              "$.differentiation[0]: unsupported quoted passage"]
+    kept, omitted = omit_unsupported(payload, errors)
+    assert kept["swot"]["strengths"] == [{"statement": "b"}] and kept["differentiation"] == []
+    assert omitted[0].endswith("Distribution") or any("Distribution" in o for o in omitted)
+    assert payload["swot"]["strengths"][0] == {"statement": "a"}  # the input is not modified
+    # a structural error, or a support error on a single required field, means no omission at all
+    assert omit_unsupported(payload, errors + ["market: Field required"])[1] == []
+    assert omit_unsupported(payload, ["$.market.primary_market: unsupported quoted passage"])[1] == []
+
+
+def test_structured_omits_unsupported_items_after_the_last_attempt(tmp_path):
+    from bi_agent.llm import LLM
+    from bi_agent.models import omit_unsupported
+    from pydantic import BaseModel, ConfigDict
+    from tests.conftest import response, scripted, tool_use
+
+    class Row(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        statement: str
+
+    class Rows(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        rows: list[Row]
+
+    def check(obj):
+        return [f"$.rows[{i}]: no retrieved passage supports {r.statement!r}"
+                for i, r in enumerate(obj.rows) if r.statement == "invented"]
+
+    reply = response(tool_use("submit", {"rows": [{"statement": "ok"}, {"statement": "invented"}]}))
+    llm = LLM(scripted([reply, reply]), model="m", max_attempts=2)
+    out = llm.structured(system="s", user="u", schema=Rows, semantic_check=check, omit=omit_unsupported)
+    assert [r.statement for r in out.rows] == ["ok"]
+    with pytest.raises(LLMOutputError):  # without the omit hook the stage fails as before
+        LLM(scripted([reply, reply]), model="m", max_attempts=2).structured(
+            system="s", user="u", schema=Rows, semantic_check=check)

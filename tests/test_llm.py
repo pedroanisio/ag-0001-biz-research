@@ -383,3 +383,13 @@ def test_stream_retries_are_bounded_and_permanent_errors_are_not_retried():
     with pytest.raises(anthropic.BadRequestError):
         llm.structured(system="s", user="u", schema=Out)
     assert len(msgs.calls) == 1
+
+
+
+def test_single_object_sent_for_a_list_is_wrapped():
+    class Many(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        items: list[Card]
+
+    client = scripted([response(tool_use("submit", {"items": {"name": "a", "count": 1}}))])
+    assert LLM(client, model="m", max_attempts=1).structured(system="s", user="u", schema=Many).items[0].name == "a"

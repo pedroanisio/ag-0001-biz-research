@@ -190,6 +190,7 @@ def _normalize(schema: type[BaseModel], payload: Any, errors: list[dict]) -> tup
     - fields wrapped in one outer key (``{"identity": {...fields...}}``) are unwrapped;
     - a duplicated key the API renamed (``website_subject_2``) is dropped when the original exists,
       renamed back when it does not;
+    - a single object sent where a list is expected is wrapped in a list;
     - a string over its length limit is cut at the last word boundary before the limit.
     Each repair is returned as a note. Anything else is left for the model to fix.
     """
@@ -218,6 +219,9 @@ def _normalize(schema: type[BaseModel], payload: Any, errors: list[dict]) -> tup
                 else:
                     notes.append(f"renamed {key!r} to {base!r}")
                     parent[base] = parent.pop(key)
+        elif kind == "list_type" and isinstance(parent[key], dict):
+            notes.append(f"wrapped the single item sent for list {'.'.join(map(str, loc))}")
+            parent[key] = [parent[key]]
         elif kind == "string_too_long" and isinstance(parent[key], str):
             limit = (e.get("ctx") or {}).get("max_length")
             if limit:
@@ -264,7 +268,8 @@ class LLM:
         self.input_token_allowance = input_token_allowance
         self.stream_retries = 2  # extra attempts after a response stream breaks mid-way
         self._sleep = __import__("time").sleep
-        self.debug_dir: Path | None = None  # where rejected tool inputs are saved, for diagnosis
+        self.debug_dir: Path | None = None
+        self._last_payload: Any = None  # where rejected tool inputs are saved, for diagnosis
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -392,6 +397,7 @@ class LLM:
         duplicated keys, over-long strings) a few times before giving the errors back."""
         obj = None
         current = payload
+        self._last_payload = payload
         for _round in range(3):
             try:
                 obj = schema.model_validate(current)
@@ -407,6 +413,7 @@ class LLM:
                 if self.audit:
                     self.audit(current, fixed, notes)
                 current = fixed
+                self._last_payload = fixed  # what a later omission must work on (unwrapped, decoded)
         if obj is None:
             try:
                 obj = schema.model_validate(current)
@@ -427,6 +434,7 @@ class LLM:
         semantic_check: SemanticCheck | None = None,
         repair: Repair | None = None,
         shared_tools: list[tuple[str, type[BaseModel], str]] | None = None,
+        omit: Callable[[Any, list[str]], tuple[Any, list[str]]] | None = None,
     ) -> T:
         """Force ``tool_name`` and return its validated input.
 
@@ -472,6 +480,16 @@ class LLM:
             log.info("%s: output failed validation (%d problems, first: %s; top-level keys: %s); asking again",
                      tool_name, len(last_errors), last_errors[0] if last_errors else "?", _keys(payload))
             messages = messages + self._retry_messages(response, block, tool_name, last_errors)
+        if omit is not None and self._last_payload is not None:
+            # Final attempt still failed: keep the output minus the items no retrieved source supports.
+            kept, omitted = omit(self._last_payload, last_errors)
+            if omitted:
+                obj, errors = self._parse(schema, kept, semantic_check)
+                if obj is not None:
+                    log.warning("%s: omitted %d item(s) that no retrieved source supports after %d attempts: %s",
+                                tool_name, len(omitted), self.max_attempts, "; ".join(omitted[:5]))
+                    self._save_rejected(f"{tool_name}-omitted", {"omitted": omitted}, last_errors)
+                    return obj
         raise LLMOutputError(
             f"{tool_name}: output failed validation after {self.max_attempts} attempts", last_errors
         )
