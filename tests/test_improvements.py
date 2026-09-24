@@ -570,3 +570,87 @@ def test_followup_with_only_corroboration_continues_research(tmp_path, http_clie
     assert len(result.findings) == 3
     assert all(len(f.evidence_ids) == 2 and f.classification == Classification.VERIFIED_FACT for f in result.findings)
     assert store.load_json("research.partial.json")["groups"]["followup-1"]["improvements"] == 3
+
+
+SEM_PARAR_PAGE = ("Sem Parar: Tag de Pedágio, Free Flow e Seguro Auto\n1ª empresa de tag com pagamento automático\n"
+                  "Origem\n2000\nFundação do Sem Parar junto com o programa de concessão de rodovias paulistas.\n"
+                  "Aquisição\n2016\nCorpay faz aquisição do Sem Parar (B2C).\nNosso ecossistema\nZapay\nGringo\n"
+                  "Olho no Carro\nlançamento da nova marca institucional Sem Parar Corpay.")
+
+
+def _attr(value, passages, cls="company_claim"):
+    from bi_agent.models import Attr
+
+    return Attr(value=value, classification=cls, evidence_ids=["E001"],
+                supporting_passages=[{"evidence_id": "E001", "passage": p} for p in passages])
+
+
+def test_anchored_support_accepts_real_identity_values_from_the_sem_parar_run():
+    """Regression: every value below failed identify with 'unsupported quoted passage' although each
+    passage is verbatim on the crawled page."""
+    ledger = EvidenceLedger()
+    evidence(ledger, text=SEM_PARAR_PAGE)
+    ok = [
+        _attr("Sem Parar", ["Sem Parar: Tag de Pedágio, Free Flow e Seguro Auto", "1ª empresa de tag com pagamento automático"]),
+        _attr("2000", ["Origem\n2000\nFundação do Sem Parar junto com o programa de concessão de rodovias paulistas."]),
+        _attr("Sem Parar, Zapay, Gringo, Olho no Carro, Sem Parar Corpay",  # compiled from two passages
+              ["Nosso ecossistema\nZapay\nGringo\nOlho no Carro", "lançamento da nova marca institucional Sem Parar Corpay."]),
+        _attr("Adquirida pela Corpay em 2016", ["Aquisição\n2016\nCorpay faz aquisição do Sem Parar (B2C)."]),  # paraphrase
+        _attr("Acquired by Corpay in 2016", ["Aquisição\n2016\nCorpay faz aquisição do Sem Parar (B2C)."]),   # translation
+    ]
+    for a in ok:
+        assert semantic_errors(a, ledger) == [], a.value
+
+
+def test_anchored_support_still_rejects_invented_facts_and_quotes():
+    ledger = EvidenceLedger()
+    evidence(ledger, text=SEM_PARAR_PAGE)
+    passage = ["Aquisição\n2016\nCorpay faz aquisição do Sem Parar (B2C)."]
+    wrong_year = _attr("Adquirida pela Corpay em 2018", passage)
+    wrong_buyer = _attr("Adquirida pela Visa e pela Mastercard em 2016", passage)
+    invented_quote = _attr("Adquirida pela Corpay em 2016", ["Corpay comprou a empresa em 2016."])  # not on the page
+    for a in (wrong_year, wrong_buyer, invented_quote):
+        assert any("unsupported quoted passage" in e for e in semantic_errors(a, ledger)), a.value
+    from bi_agent.models import Attr
+    no_quote = Attr(value="Receita de R$ 900 milhões em 2024", classification="company_claim", evidence_ids=["E001"])
+    assert any("no retrieved passage supports" in e for e in semantic_errors(no_quote, ledger))
+
+
+
+def test_quotes_match_across_extraction_line_breaks():
+    """Regression (semparar E011): a linked word is extracted as 'da \\nCorpay\\n, multinacional'."""
+    from bi_agent.models import passage_in_source
+
+    ledger = EvidenceLedger()
+    item = evidence(ledger, text="Fazemos parte da \nCorpay\n, multinacional americana presente em mais de 200 países.")
+    assert passage_in_source(item, "Fazemos parte da Corpay, multinacional americana presente em mais de 200 países.")
+    assert not passage_in_source(item, "Fazemos parte da Visa, multinacional americana.")
+
+
+
+def test_partial_quote_plus_cited_page_supports_a_claim():
+    """Regression (semparar use_cases[6]): the quote covers part of the claim, the '24h' is elsewhere on the page."""
+    ledger = EvidenceLedger()
+    evidence(ledger, text="Guincho avulso disponível 24h. Para o atendimento emergencial sob demanda, não é necessário "
+                          "possuir Tag Sem Parar ou ter contratado previamente um plano.")
+    claim = Claim(statement="Acionamento de guincho avulso 24h sem necessidade de ser cliente ou ter assinatura prévia.",
+                  classification="company_claim", evidence_ids=["E001"],
+                  supporting_passages=[{"evidence_id": "E001", "passage": "Para o atendimento emergencial sob demanda, "
+                                        "não é necessário possuir Tag Sem Parar ou ter contratado previamente um plano."}])
+    assert semantic_errors(claim, ledger) == []
+    wrong = claim.model_copy(update={"statement": "Guincho avulso 48h sem necessidade de ser cliente."})
+    assert semantic_errors(wrong, ledger)  # 48h is neither in the quote nor on the page
+
+
+
+def test_quotes_match_fetched_markdown_and_html_entities():
+    """Regression (semparar E138/E077): web_fetch text keeps '&amp;' and Markdown emphasis/links."""
+    from bi_agent.models import passage_in_source
+
+    ledger = EvidenceLedger()
+    item = evidence(ledger, text="Corpay, Inc. (NYSE: CPAY), a global S&amp;P 500 company. Menusier, presidente da "
+                                 "**Corpay** (antiga Fleetcor), *holding* norte-americana. Veja [o relatório](https://x.test/r).")
+    assert passage_in_source(item, "Corpay, Inc. (NYSE: CPAY), a global S&P 500 company")
+    assert passage_in_source(item, "presidente da Corpay (antiga Fleetcor), holding norte-americana")
+    assert passage_in_source(item, "Veja o relatório.")
+    assert not passage_in_source(item, "a global S&P 100 company")

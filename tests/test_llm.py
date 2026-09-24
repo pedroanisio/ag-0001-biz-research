@@ -308,3 +308,13 @@ def test_rejected_inputs_are_saved_for_diagnosis(tmp_path):
     llm.structured(system="s", user="u", schema=Card)
     saved = list((tmp_path / "debug").glob("submit-*.json"))
     assert len(saved) == 1 and '"nope": 1' in saved[0].read_text()
+
+
+
+def test_json_string_with_key_equals_slip_is_decoded():
+    from bi_agent.llm import _decode_json_strings
+
+    broken = '{"value": "x", "classification="company_claim", "evidence_ids": ["E001"]}'
+    assert _decode_json_strings({"a": broken})["a"] == {"value": "x", "classification": "company_claim",
+                                                         "evidence_ids": ["E001"]}
+    assert _decode_json_strings({"a": "{not json"})["a"] == "{not json"

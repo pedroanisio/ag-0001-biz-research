@@ -161,7 +161,11 @@ def _decode_json_strings(node: Any) -> Any:
         try:
             value = json.loads(node, strict=False)
         except ValueError:
-            return node
+            # one known slip: '"key="value"' where '"key": "value"' was meant
+            try:
+                value = json.loads(re.sub(r'"(\w+)="', r'"\1": "', node), strict=False)
+            except ValueError:
+                return node
         return _decode_json_strings(value) if isinstance(value, (list, dict)) else node
     return node
 

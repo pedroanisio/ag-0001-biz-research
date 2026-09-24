@@ -197,16 +197,95 @@ def normalized_text(text: str) -> str:
     return " ".join(text.split()).casefold().strip(" .")
 
 
-def passage_supported(statement: str, evidence: Evidence, passage: str | None = None) -> bool:
-    """Conservative extractive support: no guessed entailment from a matching URL.
+def _fold(text: str) -> str:
+    """Case-, accent- and spacing-insensitive text, with numbers written one way
+    ("1.000" / "1,000" -> "1000", "4,5" -> "4.5")."""
+    import html
+    import unicodedata
 
-    Paraphrases must be regenerated as source excerpts or explicit inferences. This is a
+    # Fetched pages arrive as HTML-escaped text or Markdown; a quote is read as plain text.
+    text = html.unescape(text)
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)  # [label](url) and images -> label
+    text = re.sub(r"(\*\*|__|\*|`)", "", text)  # emphasis and code markers
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).casefold()
+    text = re.sub(r"(?<=\d)[.,](?=\d{3}(?!\d))", "", text)
+    text = re.sub(r"(?<=\d),(?=\d)", ".", text)
+    text = " ".join(text.split())
+    # Text extraction puts breaks around inline elements ("da \nCorpay\n, multinacional"), so spacing
+    # next to punctuation and brackets carries no meaning.
+    text = re.sub(r"\s+([,.;:!?)\]])", r"\1", text)
+    return re.sub(r"([(\[])\s+", r"\1", text)
+
+
+# A number may carry a unit ("5M", "20bn", "40ª") but must not start inside a word (the 2 in "B2B").
+_NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?")
+_NAME = re.compile(r"[^\W\d_][\w'’-]*", re.UNICODE)
+
+
+def claim_anchors(text: str) -> tuple[set[str], set[str]]:
+    """The hard facts of a claim: (numbers, capitalised names).
+
+    Names are capitalised words of three or more letters (or all-caps acronyms) that do not open
+    the text or a sentence, so ordinary sentence-initial words are not treated as names. These are
+    what an invented claim gets wrong (a year, an amount, a company), and they survive
+    paraphrase and translation, unlike the surrounding wording.
+    """
+    numbers = set(_NUMBER.findall(_fold(text)))
+    names: set[str] = set()
+    for m in _NAME.finditer(text):
+        word = m.group(0)
+        before = text[:m.start()].rstrip()
+        if not before or before[-1] in ".!?:;\n":
+            continue
+        word = word.rstrip("'’-")
+        if (word[0].isupper() and len(word) >= 3) or (word.isupper() and len(word) >= 2):
+            names.add(_fold(word))
+    return numbers, names
+
+
+def _contains(haystack: str, needle: str) -> bool:
+    if _NUMBER.fullmatch(needle):  # "5" is in "$5m" but not in "50" or "5.5"
+        return re.search(rf"(?<![\w.]){re.escape(needle)}(?!\d|\.\d)", haystack) is not None
+    return re.search(rf"(?<![\w.]){re.escape(needle)}(?![\w])", haystack) is not None
+
+
+def covers(statement: str, text: str) -> bool:
+    """True when ``text`` carries the statement's hard facts: every number, and at least half of the
+    names (names are often translated or abbreviated, numbers are not)."""
+    numbers, names = claim_anchors(statement)
+    folded = _fold(text)
+    if not all(_contains(folded, n) for n in numbers):
+        return False
+    found = sum(_contains(folded, n) for n in names)
+    return found * 2 >= len(names)
+
+
+def passage_in_source(evidence: Evidence, passage: str) -> bool:
+    """The quoted passage appears verbatim (ignoring case, accents and spacing) in retrieved text."""
+    if not evidence.retrieval_method or not evidence.content or not _fold(passage):
+        return False
+    return _fold(passage) in _fold(evidence.content)
+
+
+def passage_supported(statement: str, evidence: Evidence, passage: str | None = None) -> bool:
+    """Anchored support: no guessed entailment from a matching URL.
+
+    With a ``passage``: it must appear verbatim in the retrieved text and carry the statement's
+    hard facts (:func:`covers`). Without one: the retrieved text must contain the statement
+    verbatim, or carry its hard facts when it has any. A paraphrase or translation passes when its
+    numbers and names are in the source; an invented year, amount or company does not. This is a
     provenance check, not a guarantee that a publisher's assertion is true.
     """
     if not evidence.retrieval_method or not evidence.content or not normalized_text(statement):
         return False
-    quote = normalized_text(passage or statement)
-    return (normalized_text(statement) in quote and quote in normalized_text(evidence.content))
+    if passage is not None:
+        return passage_in_source(evidence, passage) and covers(statement, passage)
+    if _fold(statement) in _fold(evidence.content):
+        return True
+    # A statement with no hard facts (no number, no name) has nothing an invented version would get
+    # wrong in a checkable way; a retrieved, cited source is all that can be asked of it.
+    return covers(statement, evidence.content)
 
 
 # Ownership grouping is configured in code, never trusted from a model-supplied publisher label.
@@ -780,20 +859,37 @@ def semantic_errors(obj: BaseModel, ledger: EvidenceLedger) -> list[str]:
         ids = getattr(model, "evidence_ids", [])
         cls = getattr(model, "classification", None)
         items = [ledger.get(i) for i in ids if ledger.has(i)]
-        for support in getattr(model, "supporting_passages", []):
-            supported_value = getattr(model, support.field, None)
-            if (not isinstance(supported_value, str) or support.evidence_id not in ids
-                    or not ledger.has(support.evidence_id)
-                    or not passage_supported(supported_value, ledger.get(support.evidence_id), support.passage)):
+        supports = list(getattr(model, "supporting_passages", []))
+        fields = _factual_fields(model)
+        field_names = {f for f, _t in fields}
+        quoted: dict[str | None, list[str]] = {}  # field (None: not tied to one field) -> verbatim passages
+        for support in supports:
+            field = support.field
+            if field == "statement" and "statement" not in field_names:
+                field = "value" if "value" in field_names else None  # the default name, on a model without it
+            if (support.evidence_id not in ids or not ledger.has(support.evidence_id)
+                    or not passage_in_source(ledger.get(support.evidence_id), support.passage)):
                 errors.append(f"{path}: unsupported quoted passage")
+                continue
+            quoted.setdefault(field if field in field_names else None, []).append(support.passage)
         if cls in {Classification.COMPANY_CLAIM, Classification.THIRD_PARTY_CLAIM, Classification.VERIFIED_FACT}:
-            texts = factual_texts(model)
+            pool = [p for ps in quoted.values() for p in ps]
+            for field, text in fields:
+                own = quoted.get(field, [])
+                if own and not any(_relates(text, p) for p in own):
+                    # a quote given for this very field must be about it
+                    errors.append(f"{path}: unsupported quoted passage")
+                elif not (covers(text, "\n".join(own or pool)) if (own or pool) else False) and not any(
+                        passage_supported(text, e) for e in items):
+                    # hard facts must be in the quotes or, failing that, in the cited pages themselves
+                    errors.append(f"{path}: unsupported quoted passage" if own or pool else
+                                  f"{path}: no retrieved passage supports {text!r}; use an exact source excerpt")
+            quoted_ids = {s.evidence_id for s in supports}
             for item in items:
-                if not any(passage_supported(text, item) for text in texts):
+                relevant = item.id in quoted_ids or any(
+                    passage_supported(text, item) or _shares_anchor(text, item.content or "") for _f, text in fields)
+                if not relevant:
                     errors.append(f"{path}: citation {item.id} has no support for this claim")
-            for text in texts:
-                if not any(passage_supported(text, e) for e in items):
-                    errors.append(f"{path}: no retrieved passage supports {text!r}; use an exact source excerpt")
         if cls == Classification.ANALYTICAL_INFERENCE and not isinstance(model, NarrativeStatement):
             premises = getattr(model, "premises", [])
             if not premises:
@@ -802,6 +898,37 @@ def semantic_errors(obj: BaseModel, ledger: EvidenceLedger) -> list[str]:
                 if not ledger.has(premise.evidence_id) or not passage_supported(premise.passage, ledger.get(premise.evidence_id)):
                     errors.append(f"{path}: unsupported inference premise")
     return errors
+
+
+def _relates(statement: str, passage: str) -> bool:
+    """A quote is about a claim unless the claim states numbers and the quote contains none of them
+    ("Acme has 50 employees" quoted with "Revenue $2M."). Names alone are too weak a signal: a
+    relevant quote often omits the product name the claim repeats."""
+    numbers, _names = claim_anchors(statement)
+    folded = _fold(passage)
+    if not numbers or _fold(statement) in folded or any(_contains(folded, n) for n in numbers):
+        return True
+    # otherwise it must at least share vocabulary (word stems, so "necessidade" meets "necessario")
+    return bool(_stems(statement) & _stems(passage))
+
+
+def _stems(text: str) -> set[str]:
+    return {w[:5] for w in re.findall(r"[^\W\d_]{5,}", _fold(text))}
+
+
+def _shares_anchor(statement: str, text: str) -> bool:
+    numbers, names = claim_anchors(statement)
+    folded = _fold(text)
+    return any(_contains(folded, a) for a in numbers | names)
+
+
+def _factual_fields(model: BaseModel) -> list[tuple[str, str]]:
+    if hasattr(model, "statement"):
+        return [("statement", model.statement)]
+    if isinstance(model, Attr):
+        return [("value", model.value)] if model.value else []
+    return [(k, v) for k, v in model.model_dump().items() if isinstance(v, str)
+            and k not in {"classification", "kind", "category", "question", "dimension", "metric", "reproducibility"}]
 
 
 def factual_texts(model: BaseModel) -> list[str]:
@@ -876,6 +1003,12 @@ def repair_refs(payload: Any, ledger: EvidenceLedger) -> tuple[Any, list[str]]:
                 for i in ids:
                     if i not in kept:
                         notes.append(f"{path}: removed unknown evidence id {i}")
+                for sp in out.get("supporting_passages") or []:
+                    eid = sp.get("evidence_id") if isinstance(sp, dict) else None
+                    if (isinstance(eid, str) and eid not in kept and ledger.has(eid) and len(kept) < 12
+                            and isinstance(sp.get("passage"), str) and passage_in_source(ledger.get(eid), sp["passage"])):
+                        kept.append(eid)  # a verbatim quote from a retrieved page the model forgot to cite
+                        notes.append(f"{path}: cited {eid}, the source of a verbatim supporting passage")
                 out["evidence_ids"] = kept
                 cls = out.get("classification")
                 if isinstance(cls, str) and cls in {"verified_fact", "company_claim", "third_party_claim"} and not out.get("supporting_passages"):
@@ -887,7 +1020,7 @@ def repair_refs(payload: Any, ledger: EvidenceLedger) -> tuple[Any, list[str]]:
                         if not isinstance(text, str):
                             continue
                         for evidence_id in kept:
-                            if passage_supported(text, ledger.get(evidence_id)):
+                            if passage_in_source(ledger.get(evidence_id), text):  # only a verbatim match is a quote
                                 supports.append({"evidence_id": evidence_id, "field": field, "passage": text})
                     if supports:
                         out["supporting_passages"] = supports

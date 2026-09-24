@@ -52,6 +52,7 @@ from .models import (
     normalize_url,
     repair_refs,
     semantic_errors,
+    passage_in_source,
     passage_supported,
     SupportingPassage,
     claim_catalog,
@@ -263,14 +264,15 @@ def verify_findings(
             else:
                 rejected.append(f"[{f.topic.value}] dropped source without retrieval: {source.url}")
                 continue
-            passage = source.passage or f.statement
-            if not passage_supported(f.statement, ev, passage):
+            if not passage_supported(f.statement, ev, source.passage or None):
                 rejected.append(f"[{f.topic.value}] retrieved source does not support statement: {source.url}; "
                                 f"{ev.content_limitation or 'no matching supporting passage'}")
                 continue
             if ev.id not in ids:
                 ids.append(ev.id)
-                passages.append(SupportingPassage(evidence_id=ev.id, passage=passage))
+                quote = source.passage or (f.statement if passage_in_source(ev, f.statement) else None)
+                if quote:
+                    passages.append(SupportingPassage(evidence_id=ev.id, passage=quote))
         if not ids and f.classification != Classification.UNKNOWN:
             rejected.append(f"[{f.topic.value}] dropped finding with no verifiable source: {f.statement[:120]}")
             continue
