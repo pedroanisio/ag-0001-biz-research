@@ -956,8 +956,46 @@ def claim_catalog(**artifacts: BaseModel) -> dict[str, dict]:
                 key = "C" + hashlib.sha256(f"{name}:{path}:{text}".encode()).hexdigest()[:16]
                 result[key] = {"statement": text, "classification": model.classification.value,
                                "evidence_ids": getattr(model, "evidence_ids", []),
-                               "premises": [p.model_dump() for p in getattr(model, "premises", [])]}
+                               "premises": [p.model_dump() for p in getattr(model, "premises", [])],
+                               "supporting_passages": [p.model_dump() for p in getattr(model, "supporting_passages", [])]}
     return result
+
+
+def narrative_repair(payload: Any, ledger: EvidenceLedger, catalog: dict[str, dict]) -> tuple[Any, list[str]]:
+    """Fill each narrative statement from the validated claim it selects.
+
+    The narrative may only restate catalog claims, unchanged. So for a statement whose claim_id is
+    in the catalog, its statement, classification, evidence and supporting passages are copied from
+    that claim (the model's own copies, often re-quoted from memory, are discarded), and an
+    inference without premise claims gets the catalog's factual claims that share its evidence.
+    Nothing outside the validated catalog can enter the narrative this way.
+    """
+    payload, notes = repair_refs(payload, ledger)
+    factual = {k: v for k, v in catalog.items() if v["classification"] not in {"unknown", "analytical_inference"}}
+
+    def fix(node: Any, path: str) -> Any:
+        if isinstance(node, list):
+            return [fix(x, f"{path}[{i}]") for i, x in enumerate(node)]
+        if not isinstance(node, dict):
+            return node
+        if "claim_id" in node and node.get("claim_id") in catalog:
+            src = catalog[node["claim_id"]]
+            changed = [k for k in ("statement", "classification", "evidence_ids", "supporting_passages")
+                       if node.get(k) != src[k]]
+            node = dict(node, statement=src["statement"], classification=src["classification"],
+                        evidence_ids=list(src["evidence_ids"]), supporting_passages=list(src["supporting_passages"]))
+            if changed:
+                notes.append(f"{path}: {', '.join(changed)} copied from validated claim {node['claim_id']}")
+            if src["classification"] == "analytical_inference" and not [
+                    x for x in node.get("premise_claim_ids") or [] if x in factual]:
+                shared = [k for k, v in factual.items() if set(v["evidence_ids"]) & set(src["evidence_ids"])][:5]
+                if shared:
+                    node["premise_claim_ids"] = shared
+                    notes.append(f"{path}: premise claims taken from the catalog claims sharing its evidence")
+            return node
+        return {k: fix(v, f"{path}.{k}") for k, v in node.items()}
+
+    return fix(payload, "$"), notes
 
 
 def narrative_errors(obj: Narrative, ledger: EvidenceLedger, catalog: dict[str, dict]) -> list[str]:

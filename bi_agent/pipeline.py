@@ -52,6 +52,7 @@ from .models import (
     normalize_url,
     repair_refs,
     semantic_errors,
+    narrative_repair,
     omit_unsupported,
     passage_in_source,
     passage_supported,
@@ -567,7 +568,7 @@ def stage_narrate(store: RunStore, llm: LLM) -> Narrative:
     with metered(store, llm, "narrate"):
         narrative = llm.structured(
             system=prompts.localized(prompts.NARRATE_SYSTEM, store.lang()), user=user, schema=Narrative,
-            tool_name="submit_narrative", repair=lambda p: repair_refs(p, ledger),
+            tool_name="submit_narrative", repair=lambda p: narrative_repair(p, ledger, catalog),
             semantic_check=lambda o: narrative_errors(o, ledger, catalog),
         )
     store.save_json("claims.json", catalog)

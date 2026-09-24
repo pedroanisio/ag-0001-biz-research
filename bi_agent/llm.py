@@ -199,7 +199,9 @@ def _normalize(schema: type[BaseModel], payload: Any, errors: list[dict]) -> tup
     payload = copy.deepcopy(payload)
     notes: list[str] = []
     fields = set(schema.model_fields)
-    if isinstance(payload, dict) and not fields & set(payload):
+    # All fields inside one outer key, including when that key happens to be one of the fields
+    # (a whole narrative sent as the value of "analyst_observations").
+    if isinstance(payload, dict) and (not fields & set(payload) or len(payload) == 1):
         inner = [v for v in payload.values() if isinstance(v, dict) and len(fields & set(v)) >= len(fields) / 2]
         if len(inner) == 1:
             notes.append(f"unwrapped fields sent inside {next(k for k, v in payload.items() if v is inner[0])!r}")
@@ -210,7 +212,10 @@ def _normalize(schema: type[BaseModel], payload: Any, errors: list[dict]) -> tup
         if found is None:
             continue
         parent, key = found
-        if kind == "extra_forbidden" and isinstance(parent, dict) and isinstance(key, str):
+        if kind == "extra_forbidden" and isinstance(parent, dict) and key == "premises":
+            notes.append(f"dropped premises at {'.'.join(map(str, loc[:-1]))}, a field this output does not have")
+            parent.pop(key)
+        elif kind == "extra_forbidden" and isinstance(parent, dict) and isinstance(key, str):
             base = re.sub(r"_\d+$", "", key)
             if base != key and key in parent:
                 if base in parent:
@@ -301,7 +306,7 @@ class LLM:
                 if attempt >= self.stream_retries or not (is_transient(exc) or _is_transport_error(exc)) \
                         or isinstance(exc, LLMOutputError):
                     raise
-                wait = 2.0 * (2 ** attempt)
+                wait = 5.0 * (6 ** attempt)  # 5s, then 30s: long enough to ride out a brief outage
                 log.warning("%s: %s mid-response (%s); retrying in %.0fs (attempt %d of %d)", label,
                             type(exc).__name__, str(exc)[:120], wait, attempt + 2, self.stream_retries + 1)
                 self._sleep(wait)
@@ -463,6 +468,12 @@ class LLM:
                 messages = messages + [{"role": "user", "content": f"Call the {tool_name} tool now."}]
                 continue
             payload = _attr(block, "input")
+            # Unpack JSON strings and outer wrappers first, so repairs see the real fields.
+            unpacked, pre_notes = _normalize(schema, _decode_json_strings(payload), [])
+            if unpacked != payload:
+                log.info("%s: unpacked the tool input before repair (%s)", tool_name,
+                         "; ".join(pre_notes) or "decoded list/object fields sent as JSON strings")
+                payload = unpacked
             if repair is not None:
                 original = payload
                 payload, notes = repair(payload)

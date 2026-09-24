@@ -736,3 +736,29 @@ def test_structured_omits_unsupported_items_after_the_last_attempt(tmp_path):
     with pytest.raises(LLMOutputError):  # without the omit hook the stage fails as before
         LLM(scripted([reply, reply]), model="m", max_attempts=2).structured(
             system="s", user="u", schema=Rows, semantic_check=check)
+
+
+def test_narrative_statements_are_filled_from_their_validated_claim():
+    """Regression (semparar narrate): the model re-quoted catalog claims with passages not on the page."""
+    from bi_agent.models import narrative_repair
+
+    ledger = EvidenceLedger()
+    evidence(ledger, text="Acme has 50 employees.")
+    catalog = {
+        "C1": {"statement": "Acme has 50 employees.", "classification": "company_claim", "evidence_ids": ["E001"],
+               "premises": [], "supporting_passages": [{"evidence_id": "E001", "field": "statement",
+                                                         "passage": "Acme has 50 employees."}]},
+        "C2": {"statement": "Acme is small.", "classification": "analytical_inference", "evidence_ids": ["E001"],
+               "premises": [], "supporting_passages": []},
+    }
+    payload = {"x": [{"claim_id": "C1", "statement": "Acme has 50 employees", "classification": "verified_fact",
+                      "evidence_ids": ["E001"], "supporting_passages": [{"evidence_id": "E001", "passage": "invented quote"}]},
+                     {"claim_id": "C2", "statement": "Acme is small.", "classification": "analytical_inference",
+                      "evidence_ids": ["E001"]}],
+               "y": [{"claim_id": "C9", "statement": "Not in the catalog", "classification": "company_claim",
+                      "evidence_ids": ["E001"]}]}
+    fixed, notes = narrative_repair(payload, ledger, catalog)
+    assert fixed["x"][0]["statement"] == "Acme has 50 employees." and fixed["x"][0]["classification"] == "company_claim"
+    assert fixed["x"][0]["supporting_passages"] == catalog["C1"]["supporting_passages"]
+    assert fixed["x"][1]["premise_claim_ids"] == ["C1"]
+    assert fixed["y"][0]["statement"] == "Not in the catalog"  # unknown claims are left for validation to reject

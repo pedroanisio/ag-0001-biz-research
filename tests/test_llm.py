@@ -361,7 +361,7 @@ def test_stream_that_breaks_mid_response_is_retried():
     waits = []
     llm._sleep = waits.append
     assert llm.structured(system="s", user="u", schema=Out).name == "a"
-    assert len(msgs.calls) == 3 and waits == [2.0, 4.0]
+    assert len(msgs.calls) == 3 and waits == [5.0, 30.0]
 
 
 def test_stream_retries_are_bounded_and_permanent_errors_are_not_retried():
@@ -393,3 +393,17 @@ def test_single_object_sent_for_a_list_is_wrapped():
 
     client = scripted([response(tool_use("submit", {"items": {"name": "a", "count": 1}}))])
     assert LLM(client, model="m", max_attempts=1).structured(system="s", user="u", schema=Many).items[0].name == "a"
+
+
+
+def test_whole_output_packed_into_one_field_is_unwrapped():
+    import json as _json
+
+    packed = {"count": _json.dumps({"name": "a", "count": 1})}  # every field, as a string inside "count"
+    client = scripted([response(tool_use("submit", packed))])
+    assert LLM(client, model="m", max_attempts=1).structured(system="s", user="u", schema=Card) == Card(name="a", count=1)
+
+
+def test_premises_on_an_output_without_that_field_are_dropped():
+    client = scripted([response(tool_use("submit", {"name": "a", "count": 1, "premises": [{"evidence_id": "E1"}]}))])
+    assert LLM(client, model="m", max_attempts=1).structured(system="s", user="u", schema=Card) == Card(name="a", count=1)
