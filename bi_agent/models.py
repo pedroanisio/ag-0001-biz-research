@@ -251,7 +251,7 @@ class Claim(Strict):
 class Attr(Strict):
     """A single identity attribute with provenance. ``value`` is None when unknown."""
 
-    value: str | None = Field(default=None, max_length=500)
+    value: str | None = Field(default=None, max_length=1000)  # resolve merges website and registry detail
     classification: Classification = Classification.UNKNOWN
     evidence_ids: list[str] = Field(default_factory=list, max_length=12)
 

@@ -269,3 +269,40 @@ def test_research_retry_answers_every_tool_call():
     ])
     out, _ = LLM(client, model="m").researched(system="s", user="u", schema=Out)
     assert out.name == "a" and _answers_every_tool_use(client.messages.calls[1]["messages"])
+
+
+class Card(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(max_length=20)
+    count: int
+    note: str = ""
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"card": {"name": "a", "count": 1}}, Card(name="a", count=1)),                        # wrapped in an outer key
+    ({"name": "a", "count": 1, "count_2": 1}, Card(name="a", count=1)),                   # duplicated key
+    ({"name": "a", "note_2": "n", "count": 1}, Card(name="a", count=1, note="n")),        # renamed key
+    ({"name": "a very long name that goes on", "count": 1}, Card(name="a very long name…", count=1)),
+])
+def test_structural_slips_are_repaired_without_another_call(payload, expected):
+    client = scripted([response(tool_use("submit", payload))])
+    llm = LLM(client, model="m", max_attempts=1)
+    assert llm.structured(system="s", user="u", schema=Card) == expected and llm.calls == 1
+
+
+def test_json_string_with_raw_line_breaks_is_decoded():
+    class Many(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        items: list[Card]
+
+    client = scripted([response(tool_use("submit", {"items": '[{"name": "a", "count": 1, "note": "line\nbreak"}]'}))])
+    assert LLM(client, model="m", max_attempts=1).structured(system="s", user="u", schema=Many).items[0].note == "line\nbreak"
+
+
+def test_rejected_inputs_are_saved_for_diagnosis(tmp_path):
+    client = scripted([response(tool_use("submit", {"nope": 1})), response(tool_use("submit", {"name": "a", "count": 1}))])
+    llm = LLM(client, model="m", max_attempts=2)
+    llm.debug_dir = tmp_path / "debug"
+    llm.structured(system="s", user="u", schema=Card)
+    saved = list((tmp_path / "debug").glob("submit-*.json"))
+    assert len(saved) == 1 and '"nope": 1' in saved[0].read_text()

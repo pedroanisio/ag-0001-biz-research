@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, TypeVar
 
@@ -143,18 +144,76 @@ def _format_errors(exc: ValidationError) -> list[str]:
 
 def _decode_json_strings(node: Any) -> Any:
     """Undo a known glitch in large tool inputs: a list or object sent as a JSON-encoded string
-    (``"findings": "[{...}]"``). Strings that do not parse as a JSON list/object are left alone."""
+    (``"findings": "[{...}]"``). Strings that do not parse as a JSON list/object are left alone.
+    Parsing is lenient about raw line breaks inside strings, which such payloads often contain."""
     if isinstance(node, dict):
         return {k: _decode_json_strings(v) for k, v in node.items()}
     if isinstance(node, list):
         return [_decode_json_strings(v) for v in node]
     if isinstance(node, str) and node.lstrip()[:1] in ("[", "{"):
         try:
-            value = json.loads(node)
+            value = json.loads(node, strict=False)
         except ValueError:
             return node
         return _decode_json_strings(value) if isinstance(value, (list, dict)) else node
     return node
+
+
+def _keys(payload: Any) -> str:
+    return ", ".join(list(payload)[:8]) if isinstance(payload, dict) else type(payload).__name__
+
+
+def _at(node: Any, loc: tuple) -> tuple[Any, Any] | None:
+    """(container, key) for a validation-error location, or None if the path is gone."""
+    for part in loc[:-1]:
+        try:
+            node = node[part]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return (node, loc[-1]) if isinstance(node, (dict, list)) else None
+
+
+def _normalize(schema: type[BaseModel], payload: Any, errors: list[dict]) -> tuple[Any, list[str]]:
+    """Mechanical repairs for structural slips in a large tool input, so they cost no extra call.
+
+    - fields wrapped in one outer key (``{"identity": {...fields...}}``) are unwrapped;
+    - a duplicated key the API renamed (``website_subject_2``) is dropped when the original exists,
+      renamed back when it does not;
+    - a string over its length limit is cut at the last word boundary before the limit.
+    Each repair is returned as a note. Anything else is left for the model to fix.
+    """
+    import copy
+
+    payload = copy.deepcopy(payload)
+    notes: list[str] = []
+    fields = set(schema.model_fields)
+    if isinstance(payload, dict) and not fields & set(payload):
+        inner = [v for v in payload.values() if isinstance(v, dict) and len(fields & set(v)) >= len(fields) / 2]
+        if len(inner) == 1:
+            notes.append(f"unwrapped fields sent inside {next(k for k, v in payload.items() if v is inner[0])!r}")
+            return inner[0], notes
+    for e in errors:
+        loc, kind = tuple(e.get("loc", ())), e.get("type")
+        found = _at(payload, loc) if loc else None
+        if found is None:
+            continue
+        parent, key = found
+        if kind == "extra_forbidden" and isinstance(parent, dict) and isinstance(key, str):
+            base = re.sub(r"_\d+$", "", key)
+            if base != key and key in parent:
+                if base in parent:
+                    notes.append(f"dropped duplicate key {key!r}")
+                    parent.pop(key)
+                else:
+                    notes.append(f"renamed {key!r} to {base!r}")
+                    parent[base] = parent.pop(key)
+        elif kind == "string_too_long" and isinstance(parent[key], str):
+            limit = (e.get("ctx") or {}).get("max_length")
+            if limit:
+                cut = parent[key][: limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+                notes.append(f"shortened {'.'.join(map(str, loc))} from {len(parent[key])} to {len(cut)} characters")
+                parent[key] = cut
+    return payload, notes
 
 
 class LLM:
@@ -186,6 +245,7 @@ class LLM:
         self.thinking = thinking or {"type": "disabled"}
         self.calls = 0
         self.usage = UsageLog(model)
+        self.debug_dir: Path | None = None  # where rejected tool inputs are saved, for diagnosis
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -245,6 +305,17 @@ class LLM:
                                           page_age=_attr(r, "page_age")))
         return hits
 
+    def _save_rejected(self, tool_name: str, payload: Any, errors: list[str]) -> None:
+        if self.debug_dir is None:
+            return
+        try:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
+            path = self.debug_dir / f"{tool_name}-{self.calls:03d}.json"
+            path.write_text(json.dumps({"errors": errors, "input": payload}, indent=1, ensure_ascii=False,
+                                       default=str), encoding="utf-8")
+        except OSError as exc:  # diagnosis must never break a run
+            log.debug("could not save rejected input: %s", exc)
+
     @staticmethod
     def _retry_messages(response: Any, block: Any, tool_name: str, errors: list[str]) -> list[dict]:
         """The assistant turn plus a user turn answering *every* tool call in it.
@@ -270,17 +341,28 @@ class LLM:
         ]
 
     def _parse(self, schema: type[T], payload: Any, check: SemanticCheck | None) -> tuple[T | None, list[str]]:
-        try:
-            obj = schema.model_validate(payload)
-        except ValidationError as exc:
-            decoded = _decode_json_strings(payload)
-            if decoded == payload:
-                return None, _format_errors(exc)
+        """Validate ``payload``; on failure try the mechanical repairs (JSON strings, wrapped or
+        duplicated keys, over-long strings) a few times before giving the errors back."""
+        obj = None
+        current = payload
+        for _round in range(3):
             try:
-                obj = schema.model_validate(decoded)
-            except ValidationError as exc2:
-                return None, _format_errors(exc2)
-            log.info("decoded list/object fields the model sent as JSON strings, without another call")
+                obj = schema.model_validate(current)
+                break
+            except ValidationError as exc:
+                decoded = _decode_json_strings(current)
+                fixed, notes = _normalize(schema, decoded, exc.errors())
+                if decoded != current:
+                    notes.insert(0, "decoded list/object fields sent as JSON strings")
+                if not notes:
+                    return None, _format_errors(exc)
+                log.info("repaired the tool input without another call: %s", "; ".join(notes))
+                current = fixed
+        if obj is None:
+            try:
+                obj = schema.model_validate(current)
+            except ValidationError as exc:
+                return None, _format_errors(exc)
         errors = check(obj) if check else []
         return (obj, []) if not errors else (None, errors)
 
@@ -334,8 +416,9 @@ class LLM:
             obj, last_errors = self._parse(schema, payload, semantic_check)
             if obj is not None:
                 return obj
-            log.info("%s: output failed validation (%d problems, first: %s); asking again",
-                     tool_name, len(last_errors), last_errors[0] if last_errors else "?")
+            self._save_rejected(tool_name, payload, last_errors)
+            log.info("%s: output failed validation (%d problems, first: %s; top-level keys: %s); asking again",
+                     tool_name, len(last_errors), last_errors[0] if last_errors else "?", _keys(payload))
             messages = messages + self._retry_messages(response, block, tool_name, last_errors)
         raise LLMOutputError(
             f"{tool_name}: output failed validation after {self.max_attempts} attempts", last_errors
@@ -397,8 +480,9 @@ class LLM:
             obj, last_errors = self._parse(schema, _attr(block, "input"), None)
             if obj is not None:
                 return obj, hits
-            log.info("%s: output failed validation (%d problems, first: %s); asking again",
-                     tool_name, len(last_errors), last_errors[0] if last_errors else "?")
+            self._save_rejected(tool_name, _attr(block, "input"), last_errors)
+            log.info("%s: output failed validation (%d problems, first: %s; top-level keys: %s); asking again",
+                     tool_name, len(last_errors), last_errors[0] if last_errors else "?", _keys(_attr(block, "input")))
             messages = messages + self._retry_messages(response, block, tool_name, last_errors)
             force = True
         raise LLMOutputError(

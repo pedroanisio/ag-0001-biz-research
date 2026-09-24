@@ -91,6 +91,8 @@ def main(
     store = pipeline.RunStore(Path(args.out))
     try:
         llm = make_llm(args, client_factory) if args.stage in STAGES_NEEDING_LLM else None
+        if llm is not None:
+            llm.debug_dir = store.path("debug")  # rejected tool inputs, for diagnosing validation failures
         if args.lang and args.stage not in ("run", "crawl"):
             store.set_lang(args.lang)
         if args.stage == "run":
