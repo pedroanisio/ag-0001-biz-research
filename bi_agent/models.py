@@ -874,14 +874,15 @@ def semantic_errors(obj: BaseModel, ledger: EvidenceLedger) -> list[str]:
             quoted.setdefault(field if field in field_names else None, []).append(support.passage)
         if cls in {Classification.COMPANY_CLAIM, Classification.THIRD_PARTY_CLAIM, Classification.VERIFIED_FACT}:
             pool = [p for ps in quoted.values() for p in ps]
+            # Everything the cited sources retrieved, taken together: a value may combine facts from
+            # several of them (resolve does exactly that), but not add facts none of them contains.
+            retrieved = "\n".join(pool + [e.content for e in items if e.retrieval_method and e.content])
             for field, text in fields:
                 own = quoted.get(field, [])
                 if own and not any(_relates(text, p) for p in own):
                     # a quote given for this very field must be about it
                     errors.append(f"{path}: unsupported quoted passage")
-                elif not (covers(text, "\n".join(own or pool)) if (own or pool) else False) and not any(
-                        passage_supported(text, e) for e in items):
-                    # hard facts must be in the quotes or, failing that, in the cited pages themselves
+                elif not (retrieved and covers(text, retrieved)) and not any(passage_supported(text, e) for e in items):
                     errors.append(f"{path}: unsupported quoted passage" if own or pool else
                                   f"{path}: no retrieved passage supports {text!r}; use an exact source excerpt")
             quoted_ids = {s.evidence_id for s in supports}

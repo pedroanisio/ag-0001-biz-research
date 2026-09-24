@@ -262,6 +262,8 @@ class LLM:
         self.audit = None
         self.run_budget = run_budget or {}
         self.input_token_allowance = input_token_allowance
+        self.stream_retries = 2  # extra attempts after a response stream breaks mid-way
+        self._sleep = __import__("time").sleep
         self.debug_dir: Path | None = None  # where rejected tool inputs are saved, for diagnosis
 
     # ------------------------------------------------------------------ helpers
@@ -276,18 +278,28 @@ class LLM:
         A response cut off by ``max_tokens`` raises at once: its tool input is truncated, and
         asking again with the same limit would pay for the same truncation again.
         """
-        call_id = self.accounting.reserve(label, kwargs) if self.accounting else None
-        self.calls += 1
-        try:
-            with self.client.messages.stream(
-                model=self.model, max_tokens=self.max_tokens, thinking=self.thinking,
-                cache_control={"type": "ephemeral"}, **kwargs,
-            ) as stream:
-                response = stream.get_final_message()
-        except BaseException as exc:
-            if self.accounting:
-                self.accounting.finish(call_id, error=f"{type(exc).__name__}: final usage unavailable")
-            raise
+        for attempt in range(self.stream_retries + 1):
+            call_id = self.accounting.reserve(label, kwargs) if self.accounting else None
+            self.calls += 1
+            try:
+                with self.client.messages.stream(
+                    model=self.model, max_tokens=self.max_tokens, thinking=self.thinking,
+                    cache_control={"type": "ephemeral"}, **kwargs,
+                ) as stream:
+                    response = stream.get_final_message()
+                break
+            except BaseException as exc:
+                if self.accounting:
+                    self.accounting.finish(call_id, error=f"{type(exc).__name__}: final usage unavailable")
+                # The SDK retries a failed request before the stream starts; a stream that breaks
+                # midway (connection dropped, overloaded) surfaces here and is worth another try.
+                if attempt >= self.stream_retries or not (is_transient(exc) or _is_transport_error(exc)) \
+                        or isinstance(exc, LLMOutputError):
+                    raise
+                wait = 2.0 * (2 ** attempt)
+                log.warning("%s: %s mid-response (%s); retrying in %.0fs (attempt %d of %d)", label,
+                            type(exc).__name__, str(exc)[:120], wait, attempt + 2, self.stream_retries + 1)
+                self._sleep(wait)
         usage = Usage.from_response(label, response)
         self.usage.calls.append(usage)
         if self.accounting:
@@ -530,12 +542,25 @@ class LLM:
         )
 
 
+def _is_transport_error(exc: BaseException) -> bool:
+    """A network-level failure from the HTTP stack under the SDK (httpx2 in anthropic 1.x, httpx
+    before), e.g. "peer closed connection without sending complete message body"."""
+    for module in ("httpx2", "httpx"):
+        try:
+            transport_error = __import__(module).TransportError
+        except (ImportError, AttributeError):
+            continue
+        if isinstance(exc, transport_error):
+            return True
+    return False
+
+
 def is_transient(exc: BaseException) -> bool:
     """True for failures worth skipping past (the next call may succeed); False for ones that will
     repeat on every call (no credit, invalid key, unknown model, malformed request)."""
     import anthropic
 
-    if isinstance(exc, (LLMOutputError, anthropic.APIConnectionError)):
+    if isinstance(exc, (LLMOutputError, anthropic.APIConnectionError)) or _is_transport_error(exc):
         return True
     if isinstance(exc, anthropic.APIStatusError):
         return exc.status_code == 429 or exc.status_code >= 500

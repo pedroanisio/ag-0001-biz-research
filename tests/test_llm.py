@@ -318,3 +318,68 @@ def test_json_string_with_key_equals_slip_is_decoded():
     assert _decode_json_strings({"a": broken})["a"] == {"value": "x", "classification": "company_claim",
                                                          "evidence_ids": ["E001"]}
     assert _decode_json_strings({"a": "{not json"})["a"] == "{not json"
+
+
+class _BreakingMessages:
+    """A fake client whose stream breaks mid-response ``breaks`` times, then succeeds."""
+
+    def __init__(self, breaks: int, exc: BaseException, reply) -> None:
+        self.breaks, self.exc, self.reply, self.calls = breaks, exc, reply, []
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        outer = self
+
+        class _Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return None
+
+            def get_final_message(self):
+                if len(outer.calls) <= outer.breaks:
+                    raise outer.exc
+                return outer.reply
+
+        return _Stream()
+
+
+def _dropped() -> BaseException:
+    try:
+        import httpx2 as h
+    except ImportError:
+        import httpx as h
+    return h.RemoteProtocolError("peer closed connection without sending complete message body")
+
+
+def test_stream_that_breaks_mid_response_is_retried():
+    from types import SimpleNamespace
+
+    msgs = _BreakingMessages(2, _dropped(), response(tool_use("submit", {"name": "a", "count": 1})))
+    llm = LLM(SimpleNamespace(messages=msgs), model="m")
+    waits = []
+    llm._sleep = waits.append
+    assert llm.structured(system="s", user="u", schema=Out).name == "a"
+    assert len(msgs.calls) == 3 and waits == [2.0, 4.0]
+
+
+def test_stream_retries_are_bounded_and_permanent_errors_are_not_retried():
+    from types import SimpleNamespace
+
+    import anthropic
+    import httpx
+
+    msgs = _BreakingMessages(5, _dropped(), None)
+    llm = LLM(SimpleNamespace(messages=msgs), model="m")
+    llm._sleep = lambda s: None
+    with pytest.raises(Exception, match="peer closed"):
+        llm.structured(system="s", user="u", schema=Out)
+    assert len(msgs.calls) == 3
+    req = httpx.Request("POST", "https://x.test")
+    no_credit = anthropic.BadRequestError("400", response=httpx.Response(400, request=req), body=None)
+    msgs = _BreakingMessages(5, no_credit, None)
+    llm = LLM(SimpleNamespace(messages=msgs), model="m")
+    with pytest.raises(anthropic.BadRequestError):
+        llm.structured(system="s", user="u", schema=Out)
+    assert len(msgs.calls) == 1

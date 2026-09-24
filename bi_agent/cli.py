@@ -84,6 +84,16 @@ def _print_usage(store: pipeline.RunStore) -> None:
           + (f", ~${cost:.2f}" if cost is not None else "") + f" (details in {store.path('usage.json')})")
 
 
+def _transport_errors() -> tuple[type[BaseException], ...]:
+    found = []
+    for module in ("httpx2", "httpx"):
+        try:
+            found.append(__import__(module).TransportError)
+        except (ImportError, AttributeError):
+            pass
+    return tuple(found)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -135,6 +145,13 @@ def main(
             print(f"report written to {store.path('report.pdf')} (Markdown: {store.path('report.md')})")
         if llm is not None:
             _print_usage(store)
+    except (anthropic.APIConnectionError, *_transport_errors()) as exc:
+        _print_usage(store)
+        print(f"error: connection to the Anthropic API failed after retries: {type(exc).__name__}: {str(exc)[:200]}",
+              file=sys.stderr)
+        print(f"  finished stages are saved in {store.dir}; re-run the failed stage and the ones after it",
+              file=sys.stderr)
+        return 3
     except anthropic.APIStatusError as exc:
         _print_usage(store)
         message = exc.body.get("error", {}).get("message") if isinstance(exc.body, dict) else None

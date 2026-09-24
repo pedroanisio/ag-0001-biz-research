@@ -654,3 +654,22 @@ def test_quotes_match_fetched_markdown_and_html_entities():
     assert passage_in_source(item, "presidente da Corpay (antiga Fleetcor), holding norte-americana")
     assert passage_in_source(item, "Veja o relatório.")
     assert not passage_in_source(item, "a global S&P 100 company")
+
+
+
+def test_value_may_combine_facts_from_its_cited_sources_but_not_add_uncited_ones():
+    from bi_agent.models import Attr
+
+    """Regression (semparar resolve): ownership combines the acquisition (one source) and capital (another)."""
+    ledger = EvidenceLedger()
+    evidence(ledger, "https://news.test/a", "Corpay, which acquired Sem Parar for US$1 billion in 2016.", SourceKind.NEWS)
+    evidence(ledger, "https://trade.test/b", "Com capital social de pouco mais de R$ 2 bilhões, a Instituição de Pagamento "
+                                              "autorizada pelo Banco Central é controlada pela Corpay.", SourceKind.INDUSTRY_PUBLICATION)
+    value = ("Controlada pela Corpay, que a adquiriu em 2016 por US$1 bilhão; a Instituição de Pagamento autorizada "
+             "pelo Banco Central tem capital social de R$2 bilhões")
+    quotes = [{"evidence_id": "E001", "passage": "Corpay, which acquired Sem Parar for US$1 billion in 2016"},
+              {"evidence_id": "E002", "passage": "Com capital social de pouco mais de R$ 2 bilhões"}]
+    ok = Attr(value=value, classification="third_party_claim", evidence_ids=["E001", "E002"], supporting_passages=quotes)
+    assert semantic_errors(ok, ledger) == []
+    added = ok.model_copy(update={"value": value + ", listada na NYSE desde 2010"})  # in neither cited source
+    assert any("unsupported quoted passage" in e for e in semantic_errors(added, ledger))

@@ -290,3 +290,11 @@ Subscription. Direct sales plus self-serve. Public API. Clear pricing. WidgetClo
 the product WidgetCloud of Acme Widgets. $2B. 2024. bottom-up. vendor estimate."""
 SITE_FACTS += " " + " ".join(f"{key} signal" for key in signals_payload() if key != "offerings")
 PAGES["/"] = PAGES["/"].replace("</main>", "</main><article>" + SITE_FACTS + "</article>")
+
+
+@pytest.fixture(autouse=True)
+def no_retry_sleep(monkeypatch):
+    """Retry backoff (LLM stream retries) must not slow the suite down."""
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
