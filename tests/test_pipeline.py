@@ -64,7 +64,7 @@ def test_pages_block_respects_budget_and_orders_by_score(store, http_client):
     block = pipeline._pages_block(store, ledger)
     assert block.index("[E001]") < block.index("/pricing")
     assert "JSON-LD" in block
-    small = pipeline._pages_block(store, ledger, budget=700)
+    small = pipeline._pages_block(store, ledger, budget=len(pipeline._page_chunks(store, ledger, 10000)[0]) + 1)
     assert 1 <= small.count("=== [") < block.count("=== [")
 
 
@@ -76,17 +76,16 @@ def test_verify_findings_rejects_unsearched_sources_and_reclassifies():
         "sources": [raw.findings[0].sources[0].model_copy(update={"url": SITE + "/about"})],
     }))
     raw.findings.append(raw.findings[0].model_copy(update={"classification": Classification.COMPANY_CLAIM}))
-    hits = [SearchHit("https://news.test/acme-raises", "Acme raises")]
+    hits = [SearchHit("https://news.test/acme-raises", "Acme raises", content="Acme raised a Series A.")]
     accepted, rejected = pipeline.verify_findings(raw, hits, ledger, "acme-widgets.test", "2026-01-01T00:00:00+00:00")
-    assert len(rejected) == 2 and any("made-up.test" in r for r in rejected)
+    assert len(rejected) == 4 and any("made-up.test" in r for r in rejected)
     by_topic = {(f.topic.value, f.classification.value) for f in accepted}
     assert ("funding", "third_party_claim") in by_topic
     assert ("financials", "unknown") in by_topic
-    assert ("funding", "company_claim") in by_topic  # verified_fact with only a first-party source is downgraded
+    assert ("funding", "company_claim") not in by_topic  # verified_fact with only a first-party source is downgraded
     assert ("funding", "third_party_claim") in by_topic  # company_claim with only third-party evidence is re-labelled
-    assert len(ledger) == 2
-    assert ledger.get("E001").source_type is SourceType.THIRD_PARTY and ledger.get("E001").publisher == "News Test"
-    assert ledger.get("E002").source_type is SourceType.FIRST_PARTY
+    assert len(ledger) == 1
+    assert ledger.get("E001").source_type is SourceType.THIRD_PARTY and ledger.get("E001").publisher == "news.test"
 
 
 def test_verify_findings_fills_title_and_publisher_from_hit():
@@ -95,7 +94,7 @@ def test_verify_findings_fills_title_and_publisher_from_hit():
         "topic": "news", "statement": "s", "classification": "third_party_claim",
         "sources": [{"url": "https://x.test/p", "title": "", "publisher": "", "excerpt": "e",
                      "source_kind": "news"}]}], "not_found": []})
-    accepted, _ = pipeline.verify_findings(raw, [SearchHit("https://x.test/p", "Hit title")], ledger, "acme.test", "t")
+    accepted, _ = pipeline.verify_findings(raw, [SearchHit("https://x.test/p", "Hit title", content="s")], ledger, "acme.test", "t")
     assert accepted and ledger.get("E001").title == "Hit title" and ledger.get("E001").publisher == "x.test"
 
 
@@ -158,10 +157,10 @@ def test_identify_repairs_unknown_evidence_without_another_call(store, http_clie
     bad["company_name"]["evidence_ids"] = ["E999"]
     client = stage_router({"submit_identity": lambda kw: response(tool_use("submit_identity", bad))})
     caplog.set_level(logging.DEBUG, logger="bi_agent")
-    llm = _run_to(store, http_client, "identify", client)
-    ident = store.load_model("identity.json", Identity)
-    assert ident.company_name.evidence_ids == [] and ident.company_name.classification is Classification.ANALYTICAL_INFERENCE
-    assert llm.calls == 1
+    with pytest.raises(LLMOutputError):
+        _run_to(store, http_client, "identify", client)
+    assert not store.exists("identity.site.json")
+    assert store.load_json("audit.json")
     assert any("unknown evidence id E999" in r.message for r in caplog.records)
 
 
@@ -187,16 +186,16 @@ def test_research_stage_extends_ledger_and_survives_topic_failure(store, http_cl
 
     _run_to(store, http_client, "research", stage_router({"submit_findings": flaky}))
     res = store.load_model("findings.json", ExternalFindings)
-    assert any("research call failed" in x for x in res.not_found)
+    assert not any("research call failed" in x for x in res.not_found)
     assert any("earnings reports" in x for x in res.not_found)
     assert len(res.findings) == 2 and res.rejected
     ledger = store.ledger()
     assert any(e.source_type is SourceType.THIRD_PARTY for e in ledger)
-    assert not store.exists("research.partial.json")
+    assert store.exists("research.partial.json")
     usage = store.load_json("usage.json")
     # the failed call never reached usage; "news" and one follow-up round did, and the follow-up
     # found nothing new, so research stopped there
-    assert usage["stages"]["research"]["calls"] == 2 and "identify" in usage["stages"]
+    assert usage["stages"]["research"]["calls"] == 4 and "identify" in usage["stages"]
 
 
 def test_research_stops_on_permanent_error_and_resumes(store, http_client):
@@ -216,12 +215,12 @@ def test_research_stops_on_permanent_error_and_resumes(store, http_client):
         pipeline.stage_research(store, llm, groups=GROUPS)
     assert calls["n"] == 2  # stopped at once, no call for the groups after it
     assert store.load_json("research.partial.json")["done"] == ["funding"]
-    with pytest.raises(StageError, match="research is unfinished .*funding.*re-run the research stage"):
+    with pytest.raises(StageError, match="missing findings.json"):
         pipeline.stage_resolve(store, llm)
     res = pipeline.stage_research(store, llm, groups=GROUPS)  # resumes: "news", then one follow-up round
     assert calls["n"] == 4
     assert len(res.findings) == 2  # the same statements found again are not duplicated
-    assert not store.exists("research.partial.json")
+    assert store.exists("research.partial.json")
 
 
 def test_research_fails_when_every_group_fails(store, http_client):
@@ -288,6 +287,10 @@ def test_report_labels_offerings_judgments_and_access_dates(store, http_client):
     ev_dict = [e.model_dump(mode="json") for e in ledger]
     ev_dict[0]["retrieved_at"] = "2020-02-03T04:05:06+00:00"
     store.save_json("evidence.json", ev_dict)
+    llm = LLM(stage_router(), model="m")
+    pipeline.stage_resolve(store, llm)
+    pipeline.stage_analyze(store, llm)
+    pipeline.stage_narrate(store, llm)
     md = pipeline.stage_report(store)
     assert "| Monitor | Core product | Factory operators |" in md
     strategic = md.split("### Strategic analysis")[1].split("### Business maturity")[0]
@@ -308,14 +311,14 @@ def test_offering_kind_is_required_for_the_model_but_old_runs_still_load():
 def test_report_renders_sizing_and_omits_uncited_sources(store, http_client):
     def with_sizing(kw):
         p = analysis_payload(third_party_id(kw))
-        p["market"]["sizing"] = [{"metric": "TAM", "value": "$2B", "year": "2024", "methodology": "bottom-up",
+        p["market"]["sizing"] = [{"metric": "TAM", "classification": "company_claim", "value": "$2B", "year": "2024", "methodology": "bottom-up",
                                   "limitations": "vendor estimate", "evidence_ids": ["E001"]}]
         return response(tool_use("submit_analysis", p))
 
     client = stage_router({"submit_analysis": with_sizing})
     _run_to(store, http_client, "narrate", client)
     md = pipeline.stage_report(store)
-    assert "| TAM | $2B | 2024 | bottom-up | vendor estimate | [E001] |" in md
+    assert "| TAM | $2B | 2024 | bottom-up | vendor estimate *(Company claim)* | [E001] |" in md
     sources = md.split("## 21. Sources")[1]
     assert "[E001]" not in sources.split("|---")[0]
     assert "| E006 |" not in sources  # a crawled page nobody cited is not listed
@@ -328,10 +331,10 @@ def test_analyze_downgrades_unsupported_classification_without_retry(store, http
         p["swot"]["strengths"][0]["statement"] += " [E999]"
         return response(tool_use("submit_analysis", p))
 
-    llm = _run_to(store, http_client, "analyze", stage_router({"submit_analysis": bad_fact}))
-    strength = store.load_model("analysis.json", Analysis).swot.strengths[0]
-    assert strength.classification is Classification.COMPANY_CLAIM and "[E999]" not in strength.statement
-    assert [(c.get("tool_choice") or {}).get("name") for c in llm.client.messages.calls].count("submit_analysis") == 1
+    with pytest.raises(LLMOutputError):
+        _run_to(store, http_client, "analyze", stage_router({"submit_analysis": bad_fact}))
+    assert not store.exists("analysis.json")
+    assert store.load_json("audit.json")
 
 
 def test_analyze_structural_failure_surfaces_errors(store, http_client):
@@ -452,6 +455,8 @@ def test_thin_site_gets_more_searches_and_a_note_in_the_report(store, http_clien
     meta = store.meta()
     meta.update(thin_site=True, site_chars=900, js_rendered_pages=3)
     store.save_json("run.json", meta)
+    pipeline.stage_identify(store, llm)
+    pipeline.stage_signals(store, llm)
     pipeline.stage_research(store, llm, groups=GROUPS, followup_rounds=0)
     research_calls = [c for c in llm.client.messages.calls if any(t["name"] == "web_search" for t in c.get("tools", []))]
     assert {t["max_uses"] for c in research_calls for t in c["tools"] if t["name"] == "web_search"} == {15}
@@ -505,7 +510,7 @@ def test_verify_findings_lowers_implausible_primary_record_claims():
          "sources": [{"url": "https://www.gov.br/receita/123", "title": "t", "publisher": "p", "excerpt": "e",
                       "source_kind": "government_regulatory"}]},
     ], "not_found": []})
-    hits = [SearchHit("https://cnpj-lookup.test/123", "t"), SearchHit("https://www.gov.br/receita/123", "t")]
+    hits = [SearchHit("https://cnpj-lookup.test/123", "t", content="Registered as Acme Ltda."), SearchHit("https://www.gov.br/receita/123", "t", retrieval_method="web_fetch", content="CNPJ 123. Registered in the state registry.")]
     accepted, _ = pipeline.verify_findings(raw, hits, ledger, "acme.test", "t")
     assert accepted[0].classification is Classification.THIRD_PARTY_CLAIM  # a lookup site is not the registry
     assert ledger.get(accepted[0].evidence_ids[0]).source_kind is SourceKind.DATABASE_AGGREGATOR

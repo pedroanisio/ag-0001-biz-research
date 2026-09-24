@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, TypeVar
@@ -117,6 +119,11 @@ class SearchHit:
     url: str
     title: str
     page_age: str | None = None
+    retrieval_method: str = "web_search"
+    retrieved_at: str = ""
+    content: str | None = None
+    requested_url: str | None = None
+    content_limitation: str | None = "search result text unavailable"
 
 
 def _attr(block: Any, name: str, default: Any = None) -> Any:
@@ -229,6 +236,8 @@ class LLM:
         max_fetch_tokens: int = 20_000,
         max_research_turns: int = 4,
         thinking: dict | None = None,
+        run_budget: dict | None = None,
+        input_token_allowance: int = 1_000_000,
     ) -> None:
         if max_attempts < 1 or max_research_turns < 1:
             raise ValueError("max_attempts and max_research_turns must be >= 1")
@@ -245,6 +254,10 @@ class LLM:
         self.thinking = thinking or {"type": "disabled"}
         self.calls = 0
         self.usage = UsageLog(model)
+        self.accounting = None
+        self.audit = None
+        self.run_budget = run_budget or {}
+        self.input_token_allowance = input_token_allowance
         self.debug_dir: Path | None = None  # where rejected tool inputs are saved, for diagnosis
 
     # ------------------------------------------------------------------ helpers
@@ -259,15 +272,22 @@ class LLM:
         A response cut off by ``max_tokens`` raises at once: its tool input is truncated, and
         asking again with the same limit would pay for the same truncation again.
         """
+        call_id = self.accounting.reserve(label, kwargs) if self.accounting else None
         self.calls += 1
-        with self.client.messages.stream(
-            model=self.model, max_tokens=self.max_tokens, thinking=self.thinking,
-            cache_control={"type": "ephemeral"},  # caches the longest unchanged prefix automatically
-            **kwargs,
-        ) as stream:
-            response = stream.get_final_message()
+        try:
+            with self.client.messages.stream(
+                model=self.model, max_tokens=self.max_tokens, thinking=self.thinking,
+                cache_control={"type": "ephemeral"}, **kwargs,
+            ) as stream:
+                response = stream.get_final_message()
+        except BaseException as exc:
+            if self.accounting:
+                self.accounting.finish(call_id, error=f"{type(exc).__name__}: final usage unavailable")
+            raise
         usage = Usage.from_response(label, response)
         self.usage.calls.append(usage)
+        if self.accounting:
+            self.accounting.finish(call_id, usage if _attr(response, "usage") is not None else None)
         if usage.stop_reason == "max_tokens":
             raise LLMOutputError(
                 f"{label}: output was cut off at max_tokens={self.max_tokens}; re-run with a higher --max-tokens",
@@ -286,13 +306,21 @@ class LLM:
     def _collect_hits(response: Any) -> list[SearchHit]:
         """URLs the server tools actually retrieved: search results and successfully fetched pages."""
         hits: list[SearchHit] = []
+        stamp = datetime.now(timezone.utc).isoformat()
+        requests = {_attr(b, "id"): _attr(_attr(b, "input", {}), "url")
+                    for b in _attr(response, "content", []) or [] if _attr(b, "type") == "server_tool_use"}
         for block in _attr(response, "content", []) or []:
             if _attr(block, "type") == "web_fetch_tool_result":
                 result = _attr(block, "content")
                 if _attr(result, "type") == "web_fetch_result" and _attr(result, "url"):
                     doc = _attr(result, "content")
                     hits.append(SearchHit(url=_attr(result, "url"), title=_attr(doc, "title", "") or "",
-                                          page_age=_attr(result, "retrieved_at")))
+                                          retrieval_method="web_fetch", retrieved_at=_attr(result, "retrieved_at", stamp),
+                                          requested_url=requests.get(_attr(block, "tool_use_id")),
+                                          content=(_attr(_attr(doc, "source"), "data")
+                                                   if _attr(_attr(doc, "source"), "type") == "text" else None),
+                                          content_limitation=(None if _attr(_attr(doc, "source"), "type") == "text"
+                                                              else "document text unavailable")))
                 continue  # anything else is an error object (url_not_accessible, too many uses ...)
             if _attr(block, "type") != "web_search_tool_result":
                 continue
@@ -302,7 +330,10 @@ class LLM:
             for r in content:
                 if _attr(r, "type") == "web_search_result" and _attr(r, "url"):
                     hits.append(SearchHit(url=_attr(r, "url"), title=_attr(r, "title", "") or "",
-                                          page_age=_attr(r, "page_age")))
+                                          page_age=_attr(r, "page_age"), retrieved_at=stamp,
+                                          content=_attr(r, "text") or _attr(r, "snippet"),
+                                          content_limitation=None if (_attr(r, "text") or _attr(r, "snippet"))
+                                          else "search discovery only; encrypted/unavailable source text"))
         return hits
 
     def _save_rejected(self, tool_name: str, payload: Any, errors: list[str]) -> None:
@@ -310,7 +341,7 @@ class LLM:
             return
         try:
             self.debug_dir.mkdir(parents=True, exist_ok=True)
-            path = self.debug_dir / f"{tool_name}-{self.calls:03d}.json"
+            path = self.debug_dir / f"{tool_name}-{uuid.uuid4().hex}.json"
             path.write_text(json.dumps({"errors": errors, "input": payload}, indent=1, ensure_ascii=False,
                                        default=str), encoding="utf-8")
         except OSError as exc:  # diagnosis must never break a run
@@ -357,6 +388,8 @@ class LLM:
                 if not notes:
                     return None, _format_errors(exc)
                 log.info("repaired the tool input without another call: %s", "; ".join(notes))
+                if self.audit:
+                    self.audit(current, fixed, notes)
                 current = fixed
         if obj is None:
             try:
@@ -407,7 +440,10 @@ class LLM:
                 continue
             payload = _attr(block, "input")
             if repair is not None:
+                original = payload
                 payload, notes = repair(payload)
+                if notes and self.audit:
+                    self.audit(original, payload, notes)
                 if notes:
                     log.info("%s: %d mechanical fixes applied without another model call (-v lists them)",
                              tool_name, len(notes))
@@ -506,7 +542,7 @@ def build_client(api_key: str | None = None) -> Any:
     """Construct the real Anthropic client. Imported lazily so tests never need the SDK network path."""
     import anthropic
 
-    return anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+    return anthropic.Anthropic(api_key=api_key, max_retries=0) if api_key else anthropic.Anthropic(max_retries=0)
 
 
 def pretty(obj: BaseModel) -> str:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import json
 import os
 import sys
 from pathlib import Path
@@ -42,6 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-fetch-uses", type=int, default=3, help="web_fetch calls per research call (0 disables)")
     p.add_argument("--followup-rounds", type=int, default=pipeline.FOLLOWUP_ROUNDS,
                    help="follow-up research rounds after the topic groups (stops earlier at diminishing returns)")
+    p.add_argument("--budget-tokens", type=int, help="cumulative run token budget")
+    p.add_argument("--budget-searches", type=int, help="cumulative run search budget")
+    p.add_argument("--budget-usd", type=float, help="cumulative estimated cost budget; requires known pricing")
+    p.add_argument("--allow-private", action="store_true", help="explicitly allow private-network crawling")
     p.add_argument("--delay", type=float, default=0.5, help="seconds between page fetches")
     p.add_argument("--lang", choices=SUPPORTED, default=None,
                    help="report language (default: the website's language, detected at crawl)")
@@ -50,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("run", "crawl"):
         s = sub.add_parser(name)
         s.add_argument("--url", required=True)
-    for name in ("identify", "signals", "research", "resolve", "analyze", "narrate", "report"):
+    for name in ("identify", "signals", "research", "resolve", "analyze", "narrate", "report", "status"):
         sub.add_parser(name)
     return p
 
@@ -59,11 +64,12 @@ def make_llm(args: argparse.Namespace, client_factory: Callable[[], object] = bu
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise BiAgentError("ANTHROPIC_API_KEY is not set; the LLM stages cannot run")
     return LLM(client_factory(), model=args.model, max_search_uses=args.max_search_uses,
-               max_fetch_uses=args.max_fetch_uses, max_tokens=args.max_tokens)
+               max_fetch_uses=args.max_fetch_uses, max_tokens=args.max_tokens,
+               run_budget={"tokens": args.budget_tokens, "searches": args.budget_searches, "cost_usd": args.budget_usd})
 
 
 def make_crawler(args: argparse.Namespace, http_client: httpx.Client | None = None) -> Crawler:
-    return Crawler(http_client or httpx.Client(), max_pages=args.max_pages, delay_seconds=args.delay)
+    return Crawler(http_client or httpx.Client(), max_pages=args.max_pages, delay_seconds=args.delay, allow_private=args.allow_private)
 
 
 def _print_usage(store: pipeline.RunStore) -> None:
@@ -103,6 +109,8 @@ def main(
             pages = pipeline.stage_crawl(store, args.url, make_crawler(args, http_client), args.lang)
             print(f"crawled {len(pages)} pages into {store.dir} (site language: {store.site_lang()}, "
                   f"report language: {store.lang()})")
+        elif args.stage == "status":
+            print(json.dumps(store.status(), indent=2))
         elif args.stage == "identify":
             ident = pipeline.stage_identify(store, llm)
             print(f"identity: {ident.company_name.value or 'unknown'}")
@@ -111,7 +119,8 @@ def main(
             print(f"site signals: {len(sig.offerings)} offerings")
         elif args.stage == "research":
             res = pipeline.stage_research(store, llm, followup_rounds=args.followup_rounds)
-            print(f"research: {len(res.findings)} findings, {len(res.rejected)} rejected")
+            print(f"research: {len(res.findings)} findings, {len(res.rejected)} rejected, "
+                  f"{len(res.incomplete_groups)} unfinished groups (resume with research)")
         elif args.stage == "resolve":
             ident = pipeline.stage_resolve(store, llm)
             print(f"identity: {ident.company_name.value or 'unknown'} (legal name: {ident.legal_name.value or 'unknown'})")
@@ -133,7 +142,7 @@ def main(
         print(f"  finished stages are saved in {store.dir}; re-run the failed stage and the ones after it",
               file=sys.stderr)
         return 3
-    except BiAgentError as exc:
+    except (BiAgentError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         for e in getattr(exc, "errors", [])[:20]:
             print(f"  - {e}", file=sys.stderr)

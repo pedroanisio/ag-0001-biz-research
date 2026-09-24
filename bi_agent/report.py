@@ -19,6 +19,7 @@ from .models import (
     ExternalFindings,
     Identity,
     Narrative,
+    NarrativeStatement,
     SiteSignals,
 )
 
@@ -29,7 +30,8 @@ def _cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
-def _cites(ids: list[str]) -> str:
+def _cites(ids: list[str], premises=()) -> str:
+    ids = [*ids, *(p.evidence_id for p in premises)]
     return " ".join(f"[{i}]" for i in sorted(dict.fromkeys(ids), key=lambda i: int(i[1:])))
 
 
@@ -38,8 +40,10 @@ def _cap(text: str) -> str:
     return text[:1].upper() + text[1:]
 
 
-def _paras(paragraphs: list[str]) -> str:
-    return "\n\n".join(p.strip() for p in paragraphs)
+def _paras(paragraphs: list[NarrativeStatement], lang: str = "en") -> str:
+    t = Translator(lang)
+    return "\n\n".join(f"{p.statement} *({t(p.classification.value)})* {_cites(p.evidence_ids)}".rstrip()
+                          for p in paragraphs)
 
 
 def _cited_ids(*texts: str) -> set[str]:
@@ -73,7 +77,7 @@ def render_report(
         return t(getattr(cls, "value", cls))
 
     def claim_line(c: Claim) -> str:
-        return f"- {c.statement} *({label(c.classification)})* {_cites(c.evidence_ids)}".rstrip()
+        return f"- {c.statement} *({label(c.classification)})* {_cites(c.evidence_ids, c.premises)}".rstrip()
 
     def claims(items: list[Claim], empty: str = "nothing") -> str:
         return "\n".join(claim_line(c) for c in items) if items else f"_{t(empty)}_"
@@ -81,12 +85,12 @@ def render_report(
     def attr(x: Attr) -> str:
         if x.value is None:
             return t("unknown")
-        return f"{_cell(x.value)} *({label(x.classification)})* {_cites(x.evidence_ids)}".rstrip()
+        return f"{_cell(x.value)} *({label(x.classification)})* {_cites(x.evidence_ids, x.premises)}".rstrip()
 
     def section(num: int, paras: list[str] | None = None) -> None:
         w(f"## {num}. {t(f's{num}')}\n")
         if paras is not None:
-            w(_paras(paras) + "\n")
+            w(_paras(paras, lang) + "\n")
 
     def sub(key: str, content: str) -> None:
         w(f"**{t(key)}**\n\n{content}\n")
@@ -135,7 +139,7 @@ def render_report(
     section(4, n.problems_it_solves)
     w(_head(t("pain_type"), t("problem"), t("consequence"), t("evidence")))
     for p in a.pains:
-        w(f"| {_cap(t('pain.' + p.kind.value))} | {_cell(p.description)} | {_cell(p.consequence_if_unsolved)} | {_cites(p.evidence_ids)} |")
+        w(f"| {_cap(t('pain.' + p.kind.value))} | {_cell(p.description)} | {_cell(p.consequence_if_unsolved)} *({label(p.classification)})* | {_cites(p.evidence_ids, p.premises)} |")
     w("")
 
     section(5, n.products_and_services)
@@ -143,7 +147,7 @@ def render_report(
             t("monetization"), t("basis")))
     for o in signals.offerings:
         w(f"| {_cell(o.name)} | {_cap(t('kind.' + o.kind.value))} | {_cell(o.target_customer)} | {_cell(o.problem_solved)} | {_cell(o.key_capabilities)} | "
-          f"{_cell(o.business_benefit)} | {_cell(o.monetization)} | {label(o.classification)} {_cites(o.evidence_ids)} |")
+          f"{_cell(o.business_benefit)} | {_cell(o.monetization)} | {label(o.classification)} {_cites(o.evidence_ids, o.premises)} |")
     if not signals.offerings:
         w(f"| — | — | — | — | — | — | — | {t('no_offerings')} |")
     w("")
@@ -186,7 +190,7 @@ def render_report(
     if m.sizing:
         w(_head(t("metric"), t("value"), t("year"), t("methodology"), t("limitations"), t("source")))
         for s in m.sizing:
-            w(f"| {s.metric} | {_cell(s.value)} | {s.year} | {_cell(s.methodology)} | {_cell(s.limitations)} | {_cites(s.evidence_ids)} |")
+            w(f"| {s.metric} | {_cell(s.value)} | {s.year} | {_cell(s.methodology)} | {_cell(s.limitations)} *({label(s.classification)})* | {_cites(s.evidence_ids, s.premises)} |")
     else:
         w(f"_{t('no_sizing')}_")
     w("")
@@ -198,13 +202,13 @@ def render_report(
     for c in sorted(a.competitors, key=lambda x: order[x.category]):
         w(f"| {_cell(c.name)} | {_cap(t('cat.' + c.category.value))} | {_cell(c.offering)} | {_cell(c.target_segment)} | "
           f"{_cell(c.business_model)} | {_cell(c.key_strength)} | {_cell(c.key_difference)} | "
-          f"{label(c.classification)} {_cites(c.evidence_ids)} |")
+          f"{label(c.classification)} {_cites(c.evidence_ids, c.premises)} |")
     w("")
 
     section(12, n.differentiation_and_defensibility)
     w(_head(t("dimension"), t("claimed_diff"), t("observable_diff"), t("reproducibility"), t("evidence")))
     for d in a.differentiation:
-        w(f"| {_cell(d.dimension)} | {_cell(d.claimed)} | {_cell(d.observable)} | {_cap(t('repro.' + d.reproducibility.value))} | {_cites(d.evidence_ids)} |")
+        w(f"| {_cell(d.dimension)} | {_cell(d.claimed)} | {_cell(d.observable)} | {_cap(t('repro.' + d.reproducibility.value))} *({label(d.classification)})* | {_cites(d.evidence_ids, d.premises)} |")
     w("")
 
     section(13, n.customers_partnerships_ecosystem)
@@ -228,13 +232,13 @@ def render_report(
     w(f"### {t('strategic_analysis')}\n")
     w(f"_{t('strategic_note')}_\n")
     for s in a.strategic:
-        w(f"**{t.question(s.question)}**\n\n{s.answer} *({t('analytical_inference')})* {_cites(s.evidence_ids)}\n"
+        w(f"**{t.question(s.question)}**\n\n{s.answer} *({label(s.classification)})* {_cites(s.evidence_ids, s.premises)}\n"
           .replace(" \n", "\n"))
 
     w(f"### {t('business_maturity')}\n")
     w(_head(t("dimension"), t("evidence")))
     for r in a.maturity:
-        w(f"| {t.dimension(r.dimension)} | {_cell(r.evidence)} {_cites(r.evidence_ids)} |")
+        w(f"| {t.dimension(r.dimension)} | {_cell(r.evidence)} *({label(r.classification)})* {_cites(r.evidence_ids, r.premises)} |")
     w("")
 
     section(17, n.risks_and_red_flags)
@@ -243,7 +247,7 @@ def render_report(
     section(18, n.strategic_opportunities)
     w(_head(t("type"), t("opportunity"), t("why_exists"), t("evidence")))
     for o in a.opportunities:
-        w(f"| {_cell(o.kind)} | {_cell(o.description)} | {_cell(o.rationale)} | {_cites(o.evidence_ids)} |")
+        w(f"| {_cell(o.kind)} | {_cell(o.description)} | {_cell(o.rationale)} *({label(o.classification)})* | {_cites(o.evidence_ids, o.premises)} |")
     w("")
 
     section(19, n.analyst_observations)
@@ -253,6 +257,11 @@ def render_report(
     questions = list(a.open_questions) + [t("research_gap", gap=x) for x in findings.not_found]
     w("\n".join(f"- {q}" for q in questions) if questions else f"_{t('none')}_")
     w("")
+
+    if findings.incomplete_groups:
+        w("\n" + t("research_incomplete") + "\n")
+        for group, state in findings.incomplete_groups.items():
+            w(f"- {group}: {state['status']} ({state['attempts']})")
 
     section(21)
     body = "\n".join(out)
@@ -264,6 +273,9 @@ def render_report(
             accessed = (e.retrieved_at or "")[:10] or access_date  # when the pipeline fetched it
             w(f"| {e.id} | {_cell(e.title)} | {_cell(e.publisher)} | {e.url} | {e.published or t('n_a')} | "
               f"{t(e.source_type.value)} | {t('src.' + e.source_kind.value) if e.source_kind else '—'} | {accessed} |")
+    for e in ledger:
+        if e.id in used and e.content_limitation:
+            w(f"- [{e.id}] {e.content_limitation}")
     if findings.rejected:
         w(f"\n{t('discarded')}\n")
         for r in findings.rejected:

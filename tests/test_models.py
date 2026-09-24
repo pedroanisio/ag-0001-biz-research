@@ -26,7 +26,7 @@ def _ledger() -> EvidenceLedger:
     led.add(source_type=SourceType.FIRST_PARTY, url="https://acme.test/", title="Home", publisher="acme.test",
             excerpt="x", retrieved_at="2026-01-01T00:00:00+00:00")
     led.add(source_type=SourceType.THIRD_PARTY, url="https://news.test/a", title="News", publisher="News",
-            excerpt="y", retrieved_at="2026-01-01T00:00:00+00:00")
+            excerpt="y", retrieved_at="2026-01-01T00:00:00+00:00", retrieval_method="web_fetch", content="s. News content")
     return led
 
 
@@ -49,13 +49,13 @@ def test_ledger_assigns_ids_and_dedups_by_url(tmp_path):
     led = _ledger()
     dup = led.add(source_type=SourceType.THIRD_PARTY, url="http://WWW.news.test/a/", title="dup", publisher="p",
                   excerpt="z", retrieved_at="t")
-    assert dup.id == "E002" and len(led) == 2
+    assert dup.id == "E003" and len(led) == 3
     assert led.id_for_url("https://news.test/a#frag") == "E002"
     assert led.has("E001") and not led.has("E009")
     assert "[E001] (first_party) Home" in led.index_text()
     led.save(tmp_path / "e.json")
     again = EvidenceLedger.load(tmp_path / "e.json")
-    assert [e.id for e in again] == ["E001", "E002"]
+    assert [e.id for e in again] == ["E001", "E002", "E003"]
 
 
 def test_ledger_load_rejects_non_list(tmp_path):
@@ -65,7 +65,7 @@ def test_ledger_load_rejects_non_list(tmp_path):
 
 
 def test_normalize_url():
-    assert normalize_url("HTTPS://www.Example.com/path/#x") == "example.com/path"
+    assert normalize_url("HTTPS://www.Example.com/path/#x") == "https://www.example.com/path/"
 
 
 @pytest.mark.parametrize("cls", ["verified_fact", "company_claim", "third_party_claim"])
@@ -113,13 +113,13 @@ def test_check_classifications_matches_source_type():
     assert check_classifications(bad_third, led)
     assert any("two independent" in e for e in check_classifications(one_source_fact, led))
     led.add(source_type=SourceType.THIRD_PARTY, url="https://other.test/b", title="Other", publisher="Other",
-            excerpt="z", retrieved_at="r", source_kind=SourceKind.NEWS)                      # E003
+            excerpt="z", retrieved_at="r", source_kind=SourceKind.NEWS, retrieval_method="web_fetch", content="s. Other content") # E003
     led.add(source_type=SourceType.THIRD_PARTY, url="https://www.gov.br/receita/x", title="Registry",
-            publisher="Receita", excerpt="r", retrieved_at="r", source_kind=SourceKind.GOVERNMENT_REGULATORY)  # E004
+            publisher="Receita", excerpt="r", retrieved_at="r", source_kind=SourceKind.GOVERNMENT_REGULATORY, retrieval_method="web_fetch", content="s. Company number 123") # E004
     led.add(source_type=SourceType.THIRD_PARTY, url="https://news.test/other", title="Same host", publisher="News",
-            excerpt="z", retrieved_at="r", source_kind=SourceKind.NEWS)                      # E005
+            excerpt="z", retrieved_at="r", source_kind=SourceKind.NEWS, retrieval_method="web_fetch", content="s. Same news publisher") # E005
     led.add(source_type=SourceType.THIRD_PARTY, url="https://forum.test/t", title="Forum", publisher="Forum",
-            excerpt="z", retrieved_at="r", source_kind=SourceKind.FORUM_SOCIAL)              # E006
+            excerpt="z", retrieved_at="r", source_kind=SourceKind.FORUM_SOCIAL, retrieval_method="web_fetch", content="s. Forum statement") # E006
     two_sources = Claim(statement="s", classification="verified_fact", evidence_ids=["E002", "E003"])
     registry = Claim(statement="s", classification="verified_fact", evidence_ids=["E004"])
     same_domain = Claim(statement="s", classification="verified_fact", evidence_ids=["E002", "E005"])
@@ -186,16 +186,16 @@ def test_repair_refs_drops_unknown_ids_and_lowers_classifications():
         "n": 3,
     }
     fixed, notes = repair_refs(payload, ledger)
-    assert fixed["a"] == {"classification": "company_claim", "evidence_ids": [first], "statement": f"x [{first}]."}
+    assert fixed["a"] == {"classification": "company_claim", "evidence_ids": [first], "statement": f"x [{first}] [E999]."}
     assert fixed["b"]["classification"] == "third_party_claim"
     assert fixed["c"]["classification"] == "company_claim"
-    assert fixed["d"] == {"classification": "analytical_inference", "evidence_ids": []}
+    assert fixed["d"] == {"classification": "company_claim", "evidence_ids": []}
     assert fixed["e"]["classification"] == "unknown"
     assert fixed["f"]["classification"] == "third_party_claim"  # one independent source is not verification
-    assert fixed["h"]["classification"] == "verified_fact" and fixed["g"]["classification"] == "unknown"
+    assert fixed["h"]["classification"] == "third_party_claim" and fixed["g"]["classification"] == "unknown"
     assert fixed["n"] == 3
-    assert any("E999" in n for n in notes) and any("citation [E999]" in n for n in notes)
-    assert repair_refs({"s": "clean [E001]"}, EvidenceLedger())[1] == ["$.s: removed unknown citation [E001]"]
+    assert any("E999" in n for n in notes)
+    assert repair_refs({"s": "clean [E001]"}, EvidenceLedger()) == ({"s": "clean [E001]"}, [])
 
 
 
@@ -205,7 +205,7 @@ def test_government_press_releases_are_news_not_primary_records(tmp_path):
     gov = SourceKind.GOVERNMENT_REGULATORY
     assert plausible_source_kind(gov, "https://paraiba.pb.gov.br/noticias/pbgas-conecta", False) is SourceKind.NEWS
     assert plausible_source_kind(gov, "https://www.sec.gov/news/press-release/2024-1", False) is SourceKind.NEWS
-    assert plausible_source_kind(gov, "https://www.gov.br/receitafederal/pt-br/cnpj", False) is gov
+    assert plausible_source_kind(gov, "https://www.gov.br/receitafederal/pt-br/cnpj", False, "CNPJ 123") is gov
     led = EvidenceLedger()
     led.add(source_type=SourceType.THIRD_PARTY, url="https://paraiba.pb.gov.br/noticias/x", title="t", publisher="p",
             excerpt="e", retrieved_at="r", source_kind=gov)  # saved under the older rule

@@ -8,6 +8,8 @@ products, careers, investors ...) in English, Portuguese, French, German and Spa
 from __future__ import annotations
 
 import json
+import ipaddress
+import socket
 import re
 import time
 import unicodedata
@@ -15,11 +17,12 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib import robotparser
-from urllib.parse import unquote, urljoin, urlparse, urlunparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
+from .urls import normalize_url, origin
 from .errors import CrawlError
 from .i18n import guess_text_lang, normalize_lang
 
@@ -96,7 +99,6 @@ SKIP_EXTENSIONS = (
     ".zip", ".mp4", ".mp3", ".woff", ".woff2", ".ttf", ".xml", ".json", ".rss", ".atom",
 )
 JS_SHELL_MAX_TEXT = 300  # below this much server-rendered text, a script-heavy page is an app shell
-TRACKING_PARAMS = re.compile(r"^(utm_|fbclid|gclid|mc_|ref$)")
 DEFAULT_UA = "bi-agent/1.0 (+business research crawler; respects robots.txt)"
 
 
@@ -112,6 +114,8 @@ class Page:
     lang: str | None = None
     fetched_at: str = ""
     score: int = 0
+    requested_url: str = ""
+    redirect_chain: list[str] = field(default_factory=list)
     js_rendered: bool = False  # the HTML is an app shell whose content only appears after JavaScript runs
 
     def to_dict(self) -> dict:
@@ -123,16 +127,7 @@ class Page:
 
 
 def canonical(url: str) -> str:
-    """Lower-case host, strip fragment, tracking params, default ports and trailing slash."""
-    p = urlparse(url.strip())
-    host = (p.hostname or "").lower()
-    if p.port and p.port not in (80, 443):
-        host = f"{host}:{p.port}"
-    query = "&".join(
-        kv for kv in p.query.split("&") if kv and not TRACKING_PARAMS.match(kv.split("=", 1)[0])
-    )
-    path = re.sub(r"/+$", "", p.path) or "/"
-    return urlunparse((p.scheme.lower() or "https", host, path, "", query, ""))
+    return normalize_url(url)
 
 
 def registrable_host(host: str) -> str:
@@ -227,7 +222,10 @@ def extract(url: str, html: str, status: int = 200) -> Page:
         href = str(a["href"]).strip()
         if href.startswith(("mailto:", "tel:", "javascript:", "#")):
             continue
-        absolute = canonical(urljoin(url, href))
+        try:
+            absolute = canonical(urljoin(url, href))
+        except ValueError:
+            continue
         if absolute not in seen:
             seen.add(absolute)
             links.append(absolute)
@@ -293,34 +291,115 @@ class Crawler:
         delay_seconds: float = 0.0,
         user_agent: str = DEFAULT_UA,
         sleep=time.sleep,
+        allow_private: bool = False,
+        resolver=None,
+        max_bytes: int = 3_000_000,
     ) -> None:
         if max_pages < 1:
             raise ValueError("max_pages must be >= 1")
         self.client = client
         self.max_pages = max_pages
-        self.max_fetches = max_fetches or max_pages * 3
+        if max_fetches is not None and max_fetches < 1:
+            raise ValueError("max_fetches must be >= 1")
+        if max_bytes < 1 or delay_seconds < 0:
+            raise ValueError("max_bytes must be positive and delay_seconds nonnegative")
+        self.max_fetches = max_fetches if max_fetches is not None else max(10, max_pages * 3)
         self.delay = delay_seconds
         self.ua = user_agent
         self._sleep = sleep
+        self.allow_private = allow_private
+        self.resolver = resolver or socket.getaddrinfo
+        self.max_bytes = max_bytes
+        self._requests = 0
+        self._policies: dict[str, robotparser.RobotFileParser] = {}
+        self._root_host = ""
+        self._start_origin = ""
+        self._last_request: dict[str, float] = {}
 
     # ------------------------------------------------------------------ fetching
-    def _get(self, url: str) -> httpx.Response | None:
+    def _permitted(self, url: str) -> bool:
         try:
-            return self.client.get(
-                url, headers={"User-Agent": self.ua, "Accept": "text/html,application/xhtml+xml,*/*;q=0.5"},
-                follow_redirects=True, timeout=20.0,
-            )
-        except httpx.HTTPError:
-            return None
+            url = canonical(url)
+            p = urlparse(url)
+            if self._root_host and not same_site(url, self._root_host):
+                return False
+            # Subdomains may use standard HTTP(S) ports; a custom port is confined to the
+            # explicitly supplied origin. Redirects cannot silently open another service.
+            if p.port not in (None, 80 if p.scheme == "http" else 443) and origin(url) != self._start_origin:
+                return False
+            if not self.allow_private:
+                addresses = self.resolver(p.hostname, p.port or (443 if p.scheme == "https" else 80), type=socket.SOCK_STREAM)
+                if not addresses or any(not ipaddress.ip_address(x[4][0]).is_global for x in addresses):
+                    return False
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def _get(self, url: str, *, robots: bool = False, initial: bool = False) -> httpx.Response | None:
+        requested = url
+        chain: list[str] = []
+        for _hop in range(6):
+            if not self._permitted(url) or self._requests >= self.max_fetches:
+                return None
+            url = canonical(url)
+            site = origin(url)
+            if not robots:
+                rp = self._robots(site)
+                if not rp.can_fetch(self.ua, url) or self._requests >= self.max_fetches:
+                    return None
+            delay = self.delay
+            rp = self._policies.get(site)
+            if rp is not None:
+                delay = max(delay, rp.crawl_delay(self.ua) or 0)
+            if site in self._last_request and delay:
+                self._sleep(max(0, delay - (time.monotonic() - self._last_request[site])))
+            self._requests += 1
+            self._last_request[site] = time.monotonic()
+            try:
+                with self.client.stream("GET", url, headers={"User-Agent": self.ua},
+                                        follow_redirects=False, timeout=20.0) as resp:
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        target = canonical(urljoin(url, resp.headers.get("location", "")))
+                        # Robots redirects are restricted to the same origin. Pages can
+                        # canonicalize only inside the explicitly selected site boundary.
+                        if initial and (urlparse(target).hostname or "") not in {
+                                self._root_host, "www." + self._root_host, urlparse(requested).hostname}:
+                            return None
+                        if robots and origin(target) != site:
+                            return None
+                        if urlparse(url).scheme == "https" and urlparse(target).scheme != "https":
+                            return None
+                        chain.append(url)
+                        url = target
+                        continue
+                    body = bytearray()
+                    for chunk in resp.iter_bytes(chunk_size=16_384):
+                        if len(body) + len(chunk) > self.max_bytes:
+                            return None
+                        body.extend(chunk)
+                    headers = dict(resp.headers)
+                    headers.pop("content-encoding", None)  # iter_bytes already decoded it
+                    headers.pop("content-length", None)
+                    result = httpx.Response(resp.status_code, headers=headers, content=bytes(body), request=resp.request)
+                    result.extensions.update(requested_url=requested, redirect_chain=chain)
+                    return result
+            except (httpx.HTTPError, ValueError):
+                return None
+        return None
 
     def _robots(self, root: str) -> robotparser.RobotFileParser:
-        rp = robotparser.RobotFileParser()
-        resp = self._get(urljoin(root, "/robots.txt"))
-        if resp is not None and resp.status_code == 200:
-            rp.parse(resp.text.splitlines())
-        else:
-            rp.parse([])  # no robots → everything allowed
-        return rp
+        site = origin(root)
+        if site not in self._policies:
+            rp = robotparser.RobotFileParser()
+            resp = self._get(site + "/robots.txt", robots=True)
+            if resp is not None and resp.status_code == 200:
+                rp.parse(resp.text.splitlines())
+            elif resp is not None and resp.status_code in (404, 410):
+                rp.parse([])
+            else:
+                rp.parse(["User-agent: *", "Disallow: /"])  # unavailable policy: fail closed
+            self._policies[site] = rp
+        return self._policies[site]
 
     def _sitemap_urls(self, root: str, rp: robotparser.RobotFileParser) -> list[str]:
         candidates = list(rp.site_maps() or []) or [urljoin(root, "/sitemap.xml")]
@@ -339,10 +418,18 @@ class Crawler:
 
     # ------------------------------------------------------------------ crawl loop
     def crawl(self, start_url: str) -> list[Page]:
-        if not start_url.startswith(("http://", "https://")):
+        if "://" not in start_url:
             start_url = "https://" + start_url
-        start = canonical(start_url)
-        first = self._get(start)
+        try:
+            start = canonical(start_url)
+        except ValueError as exc:
+            raise CrawlError(str(exc)) from exc
+        self._requests = 0
+        self._policies.clear()
+        self._last_request.clear()
+        self._root_host = registrable_host(urlparse(start).hostname or "")
+        self._start_origin = origin(start)
+        first = self._get(start, initial=True)
         if first is None or first.status_code >= 400:
             raise CrawlError(f"start URL {start} unreachable (status={getattr(first, 'status_code', None)})")
         start = canonical(str(first.url))
@@ -374,18 +461,15 @@ class Crawler:
             for link in home.links:
                 push(link, 1)
         for sm_url in self._sitemap_urls(root, rp):
-            push(canonical(sm_url), 1)
+            try:
+                push(canonical(sm_url), 1)
+            except ValueError:
+                continue
 
-        fetches = 1
-        while frontier and len(pages) < self.max_pages and fetches < self.max_fetches:
+        while frontier and len(pages) < self.max_pages and self._requests < self.max_fetches:
             frontier.sort(key=lambda t: (-t[0], t[1]))
             score, depth, url = frontier.pop(0)
-            if not rp.can_fetch(self.ua, url):
-                continue
-            if self.delay:
-                self._sleep(self.delay)
             resp = self._get(url)
-            fetches += 1
             if resp is None:
                 continue
             page = self._accept(resp, url, depth=depth, root_host=root_host, recorded=recorded)
@@ -411,5 +495,7 @@ class Crawler:
             return None
         recorded.add(final)
         page = extract(final, resp.text, resp.status_code)
+        page.requested_url = resp.extensions.get("requested_url", url)
+        page.redirect_chain = resp.extensions.get("redirect_chain", [])
         page.score = score_path(page.url, depth)
         return page

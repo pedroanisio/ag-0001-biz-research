@@ -316,6 +316,7 @@ STRINGS: dict[str, tuple[str, str, str, str, str]] = {
     "type": ("Type", "Tipo", "Type", "Art", "Tipo"),
     "opportunity": ("Opportunity", "Oportunidade", "Opportunité", "Chance", "Oportunidad"),
     "why_exists": ("Why it exists", "Por que existe", "Pourquoi elle existe", "Warum sie besteht", "Por qué existe"),
+    "research_incomplete": ("Could not complete research (unfinished groups):", "Não foi possível concluir a pesquisa (grupos pendentes):", "Recherche inachevée (groupes restants) :", "Recherche nicht abgeschlossen (offene Gruppen):", "No se pudo completar la investigación (grupos pendientes):"),
     "research_gap": ("Research gap: {gap}", "Lacuna de pesquisa: {gap}", "Lacune de recherche : {gap}", "Recherchelücke: {gap}", "Laguna de investigación: {gap}"),
     "none": ("None.", "Nenhuma.", "Aucune.", "Keine.", "Ninguna."),
     "id": ("Id", "Id", "Id", "Id", "Id"),

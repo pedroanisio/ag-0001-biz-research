@@ -1,94 +1,83 @@
 # bi-agent
 
-An evidence-driven company research fleet. Given one URL, it crawls the company's site, researches the company beyond the site, and produces a 21-section Company Intelligence Report in which every claim is classified (verified fact, company claim, third-party claim, analytical inference, unknown) and traceable to a source the pipeline actually retrieved.
+An evidence-driven company research pipeline. It crawls one company's website, researches external sources, and produces a 21-section Markdown/PDF report with classifications and citations.
 
-## Install
+## Install and run
 
-```
+```sh
 pip install -e ".[dev]"
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Python 3.10+. Off-site research uses Anthropic's server-side `web_search` tool, so no second search vendor is needed.
-
-## Run
-
-```
+export ANTHROPIC_API_KEY=...
 bi-agent --out runs/acme run --url https://acme.example
 ```
 
-The fleet is eight scripts sharing one run directory, so every stage can be run, inspected and re-run on its own:
+Python 3.10+ on a platform with `fcntl` writer locks. Research uses Anthropic's server-side search and fetch tools. Tests use mock HTTP transports and scripted model responses; they incur no API charges.
 
-```
-bi-agent --out runs/acme crawl --url https://acme.example   # pages.json, evidence.json, run.json
-bi-agent --out runs/acme identify                            # identity.site.json (website only)
-bi-agent --out runs/acme signals                             # signals.json
-bi-agent --out runs/acme research                            # findings.json, extends evidence.json (resumable)
-bi-agent --out runs/acme resolve                             # identity.json: website identity refined by research
-bi-agent --out runs/acme analyze                             # analysis.json
-bi-agent --out runs/acme narrate                             # narrative.json
-bi-agent --out runs/acme report                              # report.pdf (and report.md, its source)
-```
+Global options go **before** the stage name; `--url` goes after `crawl` or `run`.
 
-The PDF is typeset with reportlab from `report.md`: cover page, table of contents and PDF bookmarks, colour-coded classification labels, and `[E012]` citations that link to their row in the Sources table. Re-running `report` regenerates both files from the saved stage outputs without any API call.
-
-Options: `--model` (default `claude-sonnet-5`, or `BI_AGENT_MODEL`), `--lang` (see below), `--max-pages` (60), `--max-tokens` per response (64k; responses are streamed, and a truncated response stops the stage instead of being retried), `--max-search-uses` per research call (10), `--max-fetch-uses` per research call (3, 0 disables `web_fetch`), `--followup-rounds` (2), `--delay` between page fetches (0.5 s), `-v`. Global options go before the stage name, and `--url` goes after it.
-
-## Languages
-
-Supported: English (`en`), Brazilian Portuguese (`pt-br`), French (`fr`), German (`de`) and Spanish (`es`).
-
-- **Detection.** The crawl stage works out the site's language from the page text (a stop-word vote), falling back to `<html lang>` and then to English. The text comes first because many templates ship `lang="en-US"` over Portuguese or Spanish content. The result is saved as `site_lang` in `run.json`.
-- **Crawling.** Page-priority keywords cover all five languages (`/sobre`, `/quem-somos`, `/a-propos`, `/ueber-uns`, `/quienes-somos`, `/precos`, `/carreiras` …). Paths are matched without accents or percent-encoding, so `/preços` counts as `/precos`. A locale prefix such as `/pt-br/` is ignored for scoring, and other language versions of the same site (`/en/…` on a Portuguese site) are fetched last.
-- **Research.** The model searches in the site's language and in English, and gets that language's local registries, press, review and job sites (Receita Federal / Reclame Aqui, Infogreffe / Pappers, Handelsregister / Kununu, BORME / CNMV …).
-- **Report language.** The report is written in the site's language by default. `--lang` overrides it, and it can be passed to any stage: `bi-agent --out runs/acme --lang de report` re-renders an existing run's headings and labels. Prose the model already wrote stays in its original language until `narrate` (and the stages before it) are re-run. The model always returns the strategic questions, maturity dimensions and enum values as English keys, and the renderer translates them (`bi_agent/i18n.py`).
-
-## How the evidence discipline is enforced
-
-Every model output crosses a typed boundary with five controls:
-
-1. **Typed parse that rejects unknown fields.** Each stage forces a tool call whose input schema is a pydantic model with `extra="forbid"` (`bi_agent/models.py`).
-2. **Semantic validation the schema cannot express.** Every `evidence_ids` entry and every inline `[E###]` citation must resolve in the evidence ledger; `verified_fact` requires a primary record (government, regulator, registry or statutory filing) or two independent third-party sources on different domains (the company's own material and forums never count as independent); `company_claim` requires a first-party source; the ten strategic questions and eight maturity dimensions must appear with their exact text; market sizing requires a source, year, methodology and limitations (`models.semantic_errors`).
-3. **Defined failure path with a typed error.** Reference errors are repaired in code before validation, with no extra model call: evidence ids and `[E###]` citations missing from the ledger are removed, and a classification the remaining evidence cannot support is lowered (`verified_fact` backed only by the company becomes `company_claim`; a claim left with no evidence becomes `analytical_inference`). These are the same rules the research stage applies to findings, and every repair is logged as a warning (`models.repair_refs`). Everything else (missing questions, wrong types, unknown fields) is fed back to the model for a bounded number of attempts, then `LLMOutputError` carries the error list to the CLI (exit code 2). An Anthropic API error ends the run with exit code 3 and a one-line message.
-4. **Adversarial tests.** `tests/` feed unknown fields, fabricated evidence ids, mis-classified claims, unsearched source URLs, text-only model turns, search error blocks, off-site redirects and robots-blocked paths, and assert the failure behaviour. 120 tests, 98 % branch coverage, no network.
-5. **Loop bounds owned by ordinary code.** `max_pages`, `max_fetches`, `max_attempts`, `max_research_turns`, `max_search_uses`, five sitemaps, twelve research topics in five groups.
-
-The research stage adds two more guards:
-
-- **Retrieved sources only.** A finding's source URL is accepted only if `web_search` returned it or `web_fetch` retrieved it in the same call (or it belongs to the company's own site). Findings whose sources the model reconstructed are discarded and listed at the end of the report under "Discarded during verification".
-- **Source kinds.** Every source is labelled with the brief's source hierarchy: government/regulator, statutory filing, company material, investor disclosure, partner/customer, industry publication, news, database/aggregator, forum/social. The label is shown in the Sources table and in the evidence index the model sees. A label that would let a single source verify a fact (a primary record) is kept only for official hosts (`.gov`, `.gouv`, `.gob`, Companies House, Handelsregister, Infogreffe, CVM, SEC …). A CNPJ-lookup or registry-copy site becomes a database/aggregator.
-
-## Research depth
-
-- **Topic groups, then follow-up rounds.** After the five topic groups, up to `--followup-rounds` (2) follow-up calls are each given everything found so far. They investigate the entities discovered (parent company, owners and investors, founders, major customers and partners, key competitors), contradictions, single-source claims and recorded gaps. Research stops early once a round adds fewer than 3 new findings: that is the point of diminishing returns.
-- **Reading, not just searching.** Research calls also have `web_fetch` (up to `--max-fetch-uses`, 3 per call, 20k tokens per page), so a registry entry, filing or annual report can be read in full.
-- **Thin or JavaScript-rendered websites.** The crawler flags pages that are app shells (almost no text, script-driven). Under 20k characters or 5 pages the site counts as thin: every research call gets 50 % more searches, one extra follow-up round is allowed, the prompts tell the model to rely on external sources, and the report says so at the top. The crawler does not run JavaScript.
-- **Product or company.** `identify` records what the website represents (`website_subject`: the company itself, or a product or brand of a named organisation), using legal notices, terms, copyright lines and registration numbers. Legal-notice pages (Impressum, mentions légales, aviso legal) are fetched early for this. Research searches under the related names too (legal name, brands, parent), and `analyze` covers both the product and the organisation when they differ.
-
-## Layout
-
-```
-bi_agent/models.py    typed contracts, evidence ledger, semantic checks
-bi_agent/crawler.py   bounded robots-respecting crawler with page prioritisation
-bi_agent/llm.py       Anthropic wrapper: forced structured output, bounded retries, search-hit capture
-bi_agent/prompts.py   the analyst brief per stage (the research spec lives here)
-bi_agent/pipeline.py  stages and the run directory
-bi_agent/report.py    Markdown renderer (adds no facts)
-bi_agent/pdf.py       typesets report.md as report.pdf (reportlab)
-bi_agent/i18n.py      supported languages, site-language detection, translated report strings
-bi_agent/cli.py       subcommands
+```sh
+bi-agent --out runs/acme crawl --url https://acme.example
+bi-agent --out runs/acme identify
+bi-agent --out runs/acme signals
+bi-agent --out runs/acme research
+bi-agent --out runs/acme resolve
+bi-agent --out runs/acme analyze
+bi-agent --out runs/acme narrate
+bi-agent --out runs/acme report
+bi-agent --out runs/acme status
 ```
 
-## Cost and size
+`report` generates `report.md` and `report.pdf` from validated saved artifacts without API calls. PDF citations link to the source table. `status` shows completed, stale, incomplete, and runnable stages.
 
-One full run is 5 structured calls (plus any validation retries) and 6–7 research calls (5 topic groups plus 1–2 follow-up rounds; one more on thin sites), each with up to 10 searches and 3 page fetches, so at most 70 searches (105 on a thin site). Page text sent to the model is capped at 260k characters (6k per page).
+## Evidence and claim contracts
 
-What keeps the bill down:
+A company's own domain is not retrieval proof. Accepted sources must have a saved crawl record or a successful search/fetch result. The ledger stores retrieval method, time, requested/final URLs, observed redirect aliases, available source text, and content limitations separately from model-written excerpts. Fetch error blocks never create retrieval records. Search results with unavailable or encrypted text remain discovery records and cannot support facts until text is fetched.
 
-- **Measured, not guessed.** Every call's tokens, cache reads and writes and web searches are written to `usage.json` per stage, with an estimated cost. The CLI prints the running total after each stage.
-- **Prompt caching on every request.** Research continuations and validation retries re-read their unchanged prefix at 10 % of the input price. `identify` and `signals` send an identical system prompt (analyst role plus the highest-priority pages) and the same two tools, so `signals` reads those pages from the cache.
-- **Five research groups instead of twelve topics.** Topics that share queries (corporate, funding and leadership, for example) are researched in one call.
-- **Mechanical errors are fixed in code.** A wrong citation no longer costs a full regeneration of the analysis (see control 3).
-- **Stop on errors that will repeat.** No credit, an invalid key or an unknown model stops the research stage at once instead of failing every remaining group and then paying for `analyze` and `narrate` on empty data. Rate limits, server errors and invalid output skip only that group.
-- **Resumable research.** Progress is saved after each group in `research.partial.json`, so re-running `research` after a failure pays only for the groups that had not finished.
-- **Compact JSON in prompts** and thinking disabled by default (the output is a forced tool call validated in code). On models that support it, research uses `web_search_20260209`, which filters search results before they enter the context. Older models get `web_search_20250305` automatically.
+Factual statements use short source excerpts. The verifier checks that the statement and its supporting passage occur in the saved source text; URL equality alone is insufficient. This conservative extractive contract does not adjudicate arbitrary paraphrases or translations: such factual output must be regenerated as an excerpt. Inferences remain available with explicit quoted premises. The check establishes what the source says, not whether the publisher is truthful.
+
+Verified facts require a supporting primary document or two independent third-party sources supporting that particular statement. Official registries use parsed domain boundaries and an explicit trust list. Filings need document-level indicators; an ordinary company page or government press release cannot gain primary-record status from a model label. Search snippets alone cannot establish a primary document. Independence uses the bundled Public Suffix List (including private suffixes), known publisher ownership, original-source metadata when available, duplicate content, and recognized syndication attribution. Unknown ownership and unmarked syndication may still require analyst review. The configured ownership groups are based on [News Corp's Dow Jones description](https://newscorp.com/?company=dow-jones) and [Thomson Reuters' news products](https://www.thomsonreuters.com/en/products-services/news-media).
+
+Narrative entries reference stable IDs in a validated claim catalog saved as `claims.json` and preserve each selected statement, classification, and evidence. Inferences additionally identify factual premise claims. The renderer supplies classification labels and citations. Removing the last citation cannot turn a factual assertion into an inference. Unresolved inline assertions are rejected. Every repair performed by a pipeline model call records its original value, repaired value, and reasons in `audit.json`; research verification decisions are recorded there too. Saved inputs are validated again before narrative/report generation.
+
+Retrieved pages appear as delimited source data in user messages, never in system instructions. The system prompt states that embedded roles and instructions cannot change the task, tools, or evidence rules. The analyst system prefix and tool definitions remain shared/cacheable; page caching across forced tool changes is not assumed. The adversarial regression fixture checks this request layout and rejection of unsupported output; it is not proof that prompt injection is eliminated.
+
+## Safe saved runs
+
+`manifest.json` is the atomic commit point. It references immutable, content-addressed files in `objects/`. Each stage artifact records its run ID, schema version, producing stage, model/prompt/configuration identifiers, and input hashes. `commits/` retains manifest history. Top-level JSON, Markdown and PDF files are readable projections; stages read the committed objects, so editing a projection does not change pipeline inputs.
+
+Each stage holds a nonblocking per-run writer lock. Files are written with temporary files, `fsync`, and atomic replacement; a manifest is published after its related objects exist. Interrupted publication leaves the prior committed state readable. Re-crawling creates a new run revision and removes old artifact projections; earlier immutable objects and commit history remain available for inspection. Changes to upstream data mark dependent artifacts stale. Unversioned legacy directories cannot be resumed or rendered: start with a fresh crawl. There is no automatic migration that assumes old evidence is trustworthy.
+
+Research retains `research.partial.json`, including after publishing partial findings. Every group has pending/completed/failed status, attempts and failure history. Each outcome commits progress together with the ledger. Transient failures get at most two attempts per stage invocation; permanent API errors stop immediately. Restarting research calls only unfinished groups, and rejects checkpoints with incompatible inputs or configuration. Reports distinguish operational failures from completed searches that found no reliable evidence.
+
+Follow-ups upsert claims by topic, entity, time scope and normalized statement. They merge supporting evidence and reassess classification, deduplicate within each response, and preserve conflicting statements separately. Progress counts supported new facts, independent corroboration and supported gap resolutions. A round with fewer than three improvements ends the follow-up loop.
+
+## Crawl policy
+
+All pages, robots files, sitemaps and redirect hops share one request budget and fetch path. The crawler checks HTTP(S) URL validity, site/origin permissions, destination addresses, per-origin robots rules and pacing before issuing requests. Redirects cannot leave the selected site or downgrade HTTPS. Initial canonical-host redirects are limited to the supplied host and its root/`www` counterpart. Nonstandard ports are confined to the explicitly supplied origin. Robots redirects stay on their own origin. Missing robots files (404/410) allow crawling; unavailable/error policies fail closed.
+
+Loopback, private and link-local destinations are rejected by default. `--allow-private` explicitly enables crawling internal sites. Decoded response bodies, including compressed responses, are streamed with a 3 MB cap. The crawler does not execute JavaScript; thin sites receive more research searches and one extra follow-up round.
+
+One URL identity policy applies throughout: normalize scheme/host and the scheme's default port, preserve path/query case, trailing slash and non-default ports, strip fragments, and link aliases only through observed redirects. Tracking parameters are preserved by default; the URL utility exposes their removal as an explicit option.
+
+## Usage, budgets and options
+
+Each API call reserves an allowance in `usage.json` **before** sending the request, then immediately persists its final usage. Records include run/stage/attempt/call IDs, model, token/cache/search counts, and pricing assumptions. Totals are derived from the cumulative history; retries and stage restarts never replace earlier charges. Interrupted calls retain their reservation with unavailable final usage. Unknown prices stay unknown. Estimates use the configured price table and are not vendor invoices.
+
+```sh
+bi-agent --out runs/acme --budget-tokens 8000000 --budget-searches 80 --budget-usd 40 run --url https://acme.example
+```
+
+Budgets persist across restarts; an explicit budget option revises its saved limit. New calls are refused when completed charges plus outstanding reservations plus the next allowance exceed a limit. The token allowance reserves one million input tokens (or the request's UTF-8 byte length if larger), plus the output limit; cost reservations use the higher cache-write input rate and maximum allowed searches. This intentionally leaves headroom for server tool content. Budget refusal preserves completed work. Unknown pricing prevents admission under a cost budget. The SDK's hidden retries are disabled so every attempted request is recorded.
+
+Other options: `--model` (or `BI_AGENT_MODEL`, default `claude-sonnet-5`), `--max-pages` (60), `--max-tokens` per response (64000), `--max-search-uses` per research call (10), `--max-fetch-uses` (3; zero disables fetch), `--followup-rounds` (2), `--delay` (0.5 seconds), `--lang`, and `-v`. Model responses are streamed; truncated structured output fails immediately.
+
+Languages: English (`en`), Brazilian Portuguese (`pt-br`), French (`fr`), German (`de`), Spanish (`es`). Crawl priorities and research sources cover all five. Language is detected from page text, falling back to HTML language metadata. `--lang` overrides report/analysis language; factual source excerpts retain their original wording. Changing language invalidates model-dependent outputs, which must be regenerated.
+
+## Development
+
+```sh
+python -m pytest --cov=bi_agent --cov-report=term-missing
+```
+
+The coverage gate is 90% combined statement/branch coverage. `tests/test_improvements.py` contains the acceptance regressions for `improvements-01.md`, alongside the existing crawler, model, pipeline, multilingual and PDF tests.
+
+Main modules: `models.py` (contracts/provenance), `urls.py` (resource identity), `crawler.py`, `llm.py`, `accounting.py`, `store.py` (atomic persistence), `pipeline.py`, `prompts.py`, `report.py`, `pdf.py`, `i18n.py`, and `cli.py`.

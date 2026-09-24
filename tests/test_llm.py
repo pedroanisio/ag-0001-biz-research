@@ -73,8 +73,8 @@ def test_researched_collects_hits_and_result():
     llm = LLM(client, model="m", max_search_uses=3)
     out, hits = llm.researched(system="s", user="u", schema=Out, allowed_domains=["a.test"])
     assert out.name == "a"
-    assert hits == [SearchHit("https://a.test/1", "Title of https://a.test/1", "2025-01-01"),
-                    SearchHit("https://b.test/2", "Title of https://b.test/2", "2025-01-01")]
+    assert [h.url for h in hits] == ["https://a.test/1", "https://b.test/2"]
+    assert all(h.retrieved_at and h.content and h.retrieval_method == "web_search" for h in hits)
     tools = client.messages.calls[0]["tools"]
     assert tools[0]["type"] == "web_search_20260209" and tools[0]["max_uses"] == 3
     assert tools[0]["allowed_domains"] == ["a.test"]
@@ -220,7 +220,9 @@ def test_researched_accepts_fetched_pages_as_hits_and_ignores_fetch_errors():
         type="web_fetch_tool_error", error_code="url_not_accessible"))
     client = scripted([response(fetched, failed, tool_use("submit_findings", {"name": "a", "count": 1}))])
     _, hits = LLM(client, model="claude-sonnet-4-5", max_fetch_uses=2).researched(system="s", user="u", schema=Out)
-    assert hits == [SearchHit("https://filings.test/annual.pdf", "Annual report", "2026-09-01")]
+    assert len(hits) == 1 and hits[0].url == "https://filings.test/annual.pdf"
+    assert hits[0].retrieved_at == "2026-09-01" and hits[0].retrieval_method == "web_fetch"
+    assert hits[0].content is None and hits[0].content_limitation
     tools = {t["name"]: t for t in client.messages.calls[0]["tools"]}
     assert tools["web_fetch"]["type"] == "web_fetch_20250910" and tools["web_fetch"]["max_uses"] == 2
 

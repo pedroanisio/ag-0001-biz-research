@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -58,6 +59,12 @@ def site_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(404, text="nope", headers={"content-type": "text/html"})
 
 
+@pytest.fixture(autouse=True)
+def public_test_dns(monkeypatch):
+    # Mock transports have no DNS; policy checks use a deterministic public address.
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))])
+
+
 @pytest.fixture
 def http_client() -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(site_handler))
@@ -77,12 +84,12 @@ def text_block(text: str) -> SimpleNamespace:
 def search_result_block(urls: list[str]) -> SimpleNamespace:
     return SimpleNamespace(
         type="web_search_tool_result", tool_use_id="srvtoolu_1",
-        content=[SimpleNamespace(type="web_search_result", url=u, title=f"Title of {u}", page_age="2025-01-01") for u in urls],
+        content=[SimpleNamespace(type="web_search_result", url=u, title=f"Title of {u}", page_age="2025-01-01", text=NEWS_TEXT) for u in urls],
     )
 
 
 def response(*blocks: Any, stop_reason: str = "tool_use") -> SimpleNamespace:
-    return SimpleNamespace(content=list(blocks), stop_reason=stop_reason)
+    return SimpleNamespace(content=list(blocks), stop_reason=stop_reason, usage=SimpleNamespace(input_tokens=10, output_tokens=10))
 
 
 class FakeMessages:
@@ -133,7 +140,8 @@ def scripted(responses: list[Any]) -> FakeClient:
 
 
 def claim(statement: str, cls: str = "company_claim", ids: list[str] | None = None) -> dict:
-    return {"statement": statement, "classification": cls, "evidence_ids": ids if ids is not None else ["E001"]}
+    return {"statement": statement, "classification": cls, "evidence_ids": ids if ids is not None else ["E001"],
+            "premises": [{"evidence_id": "E001", "passage": "Acme Widgets"}] if cls == "analytical_inference" else []}
 
 
 def attr(value: str | None, cls: str = "company_claim", ids: list[str] | None = None) -> dict:
@@ -195,7 +203,7 @@ def analysis_payload(third_party_id: str = "E001") -> dict:
             "buyer_user_decision_maker": inf("Plant manager buys, technicians use"),
             "revenue_model": [c("Subscription")], "go_to_market": [c("Direct sales plus self-serve")],
         },
-        "pains": [{"kind": "operational", "description": "Unplanned downtime", "consequence_if_unsolved": "Lost output",
+        "pains": [{"kind": "operational", "description": "Unplanned downtime", "consequence_if_unsolved": "Lost output", "premises": [{"evidence_id": "E001", "passage": "Unplanned downtime"}],
                    "evidence_ids": ["E001"]}],
         "market": {
             "primary_market": inf("Industrial IoT monitoring"), "adjacent_markets": [inf("Predictive maintenance")],
@@ -207,33 +215,33 @@ def analysis_payload(third_party_id: str = "E001") -> dict:
         },
         "competitors": [{"name": "Rival Co", "category": "direct", "offering": "Monitoring", "target_segment": "Factories",
                          "business_model": "Subscription", "key_strength": "Scale", "key_difference": "Hardware bundle",
-                         "classification": "analytical_inference", "evidence_ids": []}],
+                         "classification": "analytical_inference", "evidence_ids": [], "premises": [{"evidence_id": "E001", "passage": "Acme Widgets"}]}],
         "differentiation": [{"dimension": "technology", "claimed": "Real-time", "observable": "API documented",
-                             "reproducibility": "moderate", "evidence_ids": ["E001"]}],
+                             "reproducibility": "moderate", "premises": [{"evidence_id": "E001", "passage": "Real-time telemetry, API"}], "evidence_ids": ["E001"]}],
         "technology": [c("Public API")], "commercial_signals": [claim("Series A raised", "third_party_claim", [third_party_id])],
         "financials": [claim("No revenue disclosed", "unknown", [])], "organization": [inf("Hiring sales and ML")],
         "swot": {"strengths": [c("Clear pricing")], "weaknesses": [inf("Small team")],
                  "opportunities": [inf("Adjacent predictive maintenance")], "threats": [inf("Incumbent bundling")]},
-        "strategic": [{"question": q, "answer": f"Answer to: {q}", "evidence_ids": []} for q in STRATEGIC_QUESTIONS],
-        "maturity": [{"dimension": d, "evidence": "Some evidence", "evidence_ids": ["E001"]} for d in MATURITY_DIMENSIONS],
-        "red_flags": [], "opportunities": [{"kind": "partnership", "description": "OEM channel", "rationale": "Hardware gap",
+        "strategic": [{"question": q, "answer": f"Answer to: {q}", "premises": [{"evidence_id": "E001", "passage": "Acme Widgets"}], "evidence_ids": []} for q in STRATEGIC_QUESTIONS],
+        "maturity": [{"dimension": d, "evidence": "Some evidence", "premises": [{"evidence_id": "E001", "passage": "Acme Widgets"}], "evidence_ids": ["E001"]} for d in MATURITY_DIMENSIONS],
+        "red_flags": [], "opportunities": [{"kind": "partnership", "description": "OEM channel", "rationale": "Hardware gap", "premises": [{"evidence_id": "E001", "passage": "Real-time telemetry, API"}],
                                             "evidence_ids": []}],
         "analyst_observations": [inf("Sales hiring suggests an enterprise push")],
         "open_questions": ["Who are the largest customers?"],
     }
 
 
-def narrative_payload() -> dict:
-    keys = [
-        "what_the_company_does", "problems_it_solves", "products_and_services", "customer_segments_and_use_cases",
-        "business_model_and_monetization", "go_to_market", "technology_and_ip", "market_landscape",
-        "competitive_landscape", "differentiation_and_defensibility", "customers_partnerships_ecosystem",
-        "financial_and_funding", "growth_and_traction", "risks_and_red_flags", "strategic_opportunities",
-        "analyst_observations",
-    ]
-    d = {k: [f"Paragraph about {k} [E001]."] for k in keys}
-    d["executive_summary"] = [f"Summary paragraph {i} [E001]." for i in range(5)]
-    return d
+def narrative_payload(catalog=None) -> dict:
+    from bi_agent.models import Identity, SiteSignals, Analysis, ExternalFindings, claim_catalog, Narrative
+    if catalog is None:
+        catalog = claim_catalog(identity=Identity.model_validate(identity_payload()),
+                                signals=SiteSignals.model_validate(signals_payload()),
+                                analysis=Analysis.model_validate(analysis_payload()),
+                                findings=ExternalFindings(findings=[], not_found=[]))
+    key, item = next((k, v) for k, v in catalog.items() if v["classification"] == "company_claim")
+    row = {"claim_id": key, "statement": item["statement"], "classification": item["classification"],
+           "evidence_ids": item["evidence_ids"]}
+    return {name: [dict(row) for _ in range(5 if name == "executive_summary" else 1)] for name in Narrative.model_fields}
 
 
 def third_party_id(kwargs: dict) -> str:
@@ -264,7 +272,7 @@ def stage_router(overrides: dict[str, Callable[[dict], Any]] | None = None) -> F
         if "submit_analysis" in names:
             return response(tool_use("submit_analysis", analysis_payload(third_party_id(kwargs))))
         if "submit_narrative" in names:
-            return response(tool_use("submit_narrative", narrative_payload()))
+            return response(tool_use("submit_narrative", narrative_payload(json.loads(kwargs["messages"][0]["content"].split("\n", 1)[1]))))
         raise AssertionError(f"unexpected tools {names}")
 
     return FakeClient(handler)
@@ -272,3 +280,13 @@ def stage_router(overrides: dict[str, Callable[[dict], Any]] | None = None) -> F
 
 def dumps(o: Any) -> str:
     return json.dumps(o)
+
+
+NEWS_TEXT = "Acme raised a Series A. Acme raised $5M. Series A raised. Acme Widgets Ltda. " + " ".join(
+    f"{prefix} finding {i}" for prefix in ("group-a", "group-b", "round-1", "round-2") for i in range(6))
+SITE_FACTS = """Acme Widgets. Austin, Texas. 2015. Monitor. Factory operators. Unplanned downtime.
+Real-time telemetry, API. Less downtime. Subscription from $49/month. B2B. Mid-size manufacturers.
+Subscription. Direct sales plus self-serve. Public API. Clear pricing. WidgetCloud.
+the product WidgetCloud of Acme Widgets. $2B. 2024. bottom-up. vendor estimate."""
+SITE_FACTS += " " + " ".join(f"{key} signal" for key in signals_payload() if key != "offerings")
+PAGES["/"] = PAGES["/"].replace("</main>", "</main><article>" + SITE_FACTS + "</article>")

@@ -177,7 +177,13 @@ def store(tmp_path: Path) -> pipeline.RunStore:
 def test_crawl_records_site_language_and_prompts_follow_it(store, pt_client):
     pipeline.stage_crawl(store, PT_SITE, Crawler(pt_client, max_pages=3))
     assert store.meta()["site_lang"] == "pt-br" and store.lang() == "pt-br"
-    client = stage_router()
+    from tests.conftest import identity_payload, response, tool_use
+    payload = identity_payload()
+    for value in payload.values():
+        if isinstance(value, dict):
+            value.update(value=None, classification="unknown", evidence_ids=[])
+    payload["company_name"].update(value="Esfera", classification="company_claim", evidence_ids=["E001"])
+    client = stage_router({"submit_identity": lambda kw: response(tool_use("submit_identity", payload))})
     pipeline.stage_identify(store, LLM(client, model="m"))
     assert "Brazilian Portuguese" in client.messages.calls[0]["system"][0]["text"]
 
@@ -212,6 +218,7 @@ def test_cli_lang_override_translates_the_report(tmp_path, http_client, monkeypa
     md = (tmp_path / "r" / "report.md").read_text(encoding="utf-8")
     assert summary in md and question in md
     assert "Executive Summary" not in md and "Classification key" not in md
-    # re-render the same run in English without re-running the model
-    assert cli.main(common + ["--lang", "en", "report"], client_factory=stage_router, http_client=http_client) == 0
+    # A language change invalidates model outputs; regenerate with the new configuration.
+    assert cli.main(common + ["--lang", "en", "report"], client_factory=stage_router, http_client=http_client) == 2
+    assert cli.main(common + ["--lang", "en", "run", "--url", SITE], client_factory=stage_router, http_client=http_client) == 0
     assert "## 1. Executive Summary" in (tmp_path / "r" / "report.md").read_text(encoding="utf-8")
